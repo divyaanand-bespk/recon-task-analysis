@@ -505,7 +505,7 @@ def load_rollouts(db: HorizonDatabase, task_ids: list[str]) -> dict[str, dict[st
         FROM rollouts r
         JOIN evaluations e ON e.id = r.evaluation_id
         LEFT JOIN messages m ON m.rollout_id = r.id
-        WHERE r.local_task_id IN ({ids}) AND {MODEL_FILTER_SQL}
+        WHERE r.local_task_id::uuid IN ({ids}) AND {MODEL_FILTER_SQL}
         GROUP BY r.local_task_id, r.id, e.model, e.status,
                  r.extracted_score, r.created_at
         """
@@ -530,17 +530,28 @@ def load_rollouts(db: HorizonDatabase, task_ids: list[str]) -> dict[str, dict[st
             completed,
             key=lambda row: (row["tool_calls"], row["rollout_id"]),
         )
-        representative = (
-            median_candidates[len(median_candidates) // 2]
-            if median_candidates
-            else None
-        )
+        if median_candidates:
+            representative = median_candidates[len(median_candidates) // 2]
+            rollout_source = "Completed"
+        elif long_enough:
+            representative = max(
+                long_enough,
+                key=lambda row: (row["created_at"], row["rollout_id"]),
+            )
+            rollout_source = f"Fallback: {representative['evaluation_status'].lower()}"
+        else:
+            representative = None
+            rollout_source = "Unavailable"
         result[task_id] = {
             "pass6": sum(numeric_score_is_one(row["extracted_score"]) for row in latest),
             "pass6_denominator": len(latest),
             "eligible_rollouts": len(completed),
             "incomplete_rollouts": len(long_enough) - len(completed),
             "representative": representative,
+            "rollout_source": rollout_source,
+            "representative_created_at": (
+                representative["created_at"] if representative else None
+            ),
         }
     return result
 
@@ -776,10 +787,7 @@ def analyse_tasks(
     for task_id in task_ids:
         representative = rollout_data[task_id]["representative"]
         if not representative:
-            raise RuntimeError(
-                f"{metadata[task_id]['name']} has no completed Starfall/router rollout "
-                "with more than 10 assistant turns"
-            )
+            continue
         dirname = safe_name(metadata[task_id]["name"])
         if dirname in names.values():
             dirname = f"{dirname}__{task_id[:8]}"
@@ -795,6 +803,16 @@ def analyse_tasks(
     )
     result = []
     for task_id in task_ids:
+        rp_data = (
+            rp_metrics(paths[names[task_id]])
+            if task_id in names
+            else {
+                "leading_rp": 0,
+                "total_rp": 0,
+                "tool_calls": 0,
+                "rp_complete_step": None,
+            }
+        )
         item = {
             "task_id": task_id,
             **metadata[task_id],
@@ -803,7 +821,7 @@ def analyse_tasks(
                 for key, value in rollout_data[task_id].items()
                 if key != "representative"
             },
-            **rp_metrics(paths[names[task_id]]),
+            **rp_data,
         }
         item["fit"] = fit_for_pilot(item)
         result.append(item)
@@ -847,16 +865,17 @@ select {{ font:inherit; color:inherit; background:var(--bg); border:1px solid va
 table {{ width:100%; min-width:0; table-layout:fixed; border-collapse:collapse; font-size:clamp(12px,.95vw,15px); }}
 th,td {{ padding:7px clamp(2px,.45vw,8px); border-bottom:1px solid var(--border); overflow-wrap:anywhere; vertical-align:middle; }}
 th {{ color:var(--muted); font-weight:600; text-align:left; vertical-align:bottom; }}
-th:nth-child(1),td:nth-child(1) {{ width:23%; }}
-th:nth-child(2),td:nth-child(2) {{ width:10%; }}
-th:nth-child(3),td:nth-child(3) {{ width:8%; }}
-th:nth-child(4),td:nth-child(4) {{ width:10%; }}
-th:nth-child(5),td:nth-child(5) {{ width:9%; }}
-th:nth-child(6),td:nth-child(6) {{ width:7%; }}
-th:nth-child(7),td:nth-child(7) {{ width:8%; }}
+th:nth-child(1),td:nth-child(1) {{ width:21%; }}
+th:nth-child(2),td:nth-child(2) {{ width:8%; }}
+th:nth-child(3),td:nth-child(3) {{ width:7%; }}
+th:nth-child(4),td:nth-child(4) {{ width:9%; }}
+th:nth-child(5),td:nth-child(5) {{ width:8%; }}
+th:nth-child(6),td:nth-child(6) {{ width:10%; }}
+th:nth-child(7),td:nth-child(7) {{ width:6%; }}
 th:nth-child(8),td:nth-child(8) {{ width:7%; }}
-th:nth-child(9),td:nth-child(9) {{ width:7%; }}
-th:nth-child(10),td:nth-child(10) {{ width:11%; }}
+th:nth-child(9),td:nth-child(9) {{ width:6%; }}
+th:nth-child(10),td:nth-child(10) {{ width:6%; }}
+th:nth-child(11),td:nth-child(11) {{ width:12%; }}
 .center {{ text-align:center; }} .right {{ text-align:right; }}
 .task-name {{ display:block; font-weight:600; }}
 .task-id {{ display:block; margin-top:2px; color:var(--muted); font-size:.8em; word-break:break-all; }}
@@ -879,12 +898,13 @@ footer {{ display:grid; gap:4px; border-top:1px solid var(--border); padding-top
   </section>
   <div class="toolbar"><label for="shape-filter" class="muted">Shape</label><select id="shape-filter"><option value="all">All shapes</option><option>Diagnosis</option><option>Migration</option><option>Optimization</option></select></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Task</th><th>Shape</th><th class="center">AI rubrics</th><th class="center">Gemini 3.7 Pass@6</th><th class="center">Argus Main</th><th class="right">Leading R/P</th><th class="center" title="Final successful RESEARCH_AND_PLANNING.md write step">R/P complete step</th><th class="right">Total R/P</th><th class="right">Tool calls</th><th class="center">Fit for pilot</th></tr></thead>
+    <thead><tr><th>Task</th><th>Shape</th><th class="center">AI rubrics</th><th class="center">Gemini 3.7 Pass@6</th><th class="center">Argus Main</th><th class="center">R/P rollout</th><th class="right">Leading R/P</th><th class="center" title="Final successful RESEARCH_AND_PLANNING.md write step">R/P complete step</th><th class="right">Total R/P</th><th class="right">Tool calls</th><th class="center">Fit for pilot</th></tr></thead>
     <tbody id="rows"></tbody>
   </table></div>
   <footer>
     <p>Fit requires AI rubrics Pass, fewer than 2 passes among available completed eligible Gemini 3.7 rollouts, Argus Main Pass, and more than 20 leading R/P calls. A denominator from 1 to 6 is valid.</p>
     <p>Pass@6 uses up to the latest six completed Starfall or router-16a8dce2a6e7 rollouts with more than 10 reconstructed assistant turns. Only a score of exactly 1 counts as Pass.</p>
+    <p>R/P analysis uses the median completed eligible rollout. If none exists, it uses the most recent failed or cancelled rollout with more than 10 assistant turns and marks it as a fallback.</p>
     <p>R/P complete step is the final write step for RESEARCH_AND_PLANNING.md or RESEARCH_AND_IMPLEMENTATION.md in the representative trajectory. A dash means no write was found.</p>
     <p>AI rubrics exclude Grader Coverage and general review rubrics. INFO or WARNING only Argus Main findings count as Pass.</p>
   </footer>
@@ -907,6 +927,7 @@ function render(){{
     <td class="center"><span class="${{statusClass(row.ai_rubrics)}}" title="${{row.ai_count}} applicable reviews">${{esc(row.ai_rubrics)}}</span></td>
     <td class="center"><span class="${{row.pass6<2?'pass6-good':'pass6-bad'}}" title="Latest ${{row.pass6_denominator}} of ${{row.eligible_rollouts}} completed eligible rollouts. ${{row.incomplete_rollouts}} incomplete excluded.">${{row.pass6}}/${{row.pass6_denominator}}</span></td>
     <td class="center"><span class="${{statusClass(row.argus_main)}}">${{esc(row.argus_main)}}</span></td>
+    <td class="center"><span class="${{row.rollout_source?.startsWith('Fallback:')?'progress':''}}" title="${{esc(row.representative_created_at??'No representative rollout')}}">${{esc(row.rollout_source??'Completed')}}</span></td>
     <td class="right">${{row.leading_rp}}</td>
     <td class="center">${{row.rp_complete_step??'—'}}</td>
     <td class="right">${{row.total_rp}}</td>

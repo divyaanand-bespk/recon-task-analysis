@@ -36,6 +36,7 @@ Use `--base-html existing-report.html` to add the new tasks to an existing repor
 - Pass@6 uses the latest six completed Starfall or `router-16a8dce2a6e7` rollouts with more than 10 assistant turns.
 - Only a rollout score of exactly `1` counts as a pass.
 - The representative trajectory is the median eligible rollout by tool-call count.
+- If no completed eligible trajectory exists, R/P analysis uses the most recent failed or cancelled rollout with more than 10 assistant turns and flags it as a fallback.
 - AI rubrics exclude Grader Coverage and general review rubrics.
 - Argus Main passes when the review passes, or when its findings contain only INFO or WARNING severity.
 - Fit for Pilot requires AI rubrics Pass, Pass@6 below 2, at least one eligible rollout, Argus Main Pass, and more than 20 leading research or planning calls.
