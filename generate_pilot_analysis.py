@@ -830,7 +830,8 @@ def fit_for_pilot(item: dict[str, Any]) -> str:
         and int(item.get("pass6", 99)) < 2
         and int(item.get("pass6_denominator", 0)) > 0
         and item.get("argus_main") == "Pass"
-        and int(item.get("leading_rp", 0)) > 20
+        and item.get("rp_complete_step") is not None
+        and int(item["rp_complete_step"]) > 20
         else "NO"
     )
 
@@ -963,7 +964,7 @@ footer {{ display:grid; gap:4px; border-top:1px solid var(--border); padding-top
     <tbody id="rows"></tbody>
   </table></div>
   <footer>
-    <p>Fit requires AI rubrics Pass, fewer than 2 passes among available completed eligible Gemini 3.7 rollouts, Argus Main Pass, and more than 20 leading R/P calls. A denominator from 1 to 6 is valid.</p>
+    <p>Fit requires AI rubrics Pass, fewer than 2 passes among available completed eligible Gemini 3.7 rollouts, Argus Main Pass, and an R/P complete step greater than 20. A denominator from 1 to 6 is valid.</p>
     <p>Pass@6 uses up to the latest six completed Starfall or router-16a8dce2a6e7 rollouts with more than 10 reconstructed assistant turns. Only a score of exactly 1 counts as Pass.</p>
     <p>R/P analysis uses the median completed eligible rollout. If none exists, it uses the most recent failed or cancelled rollout with more than 10 assistant turns and marks it as a fallback.</p>
     <p>R/P complete step is the final write step for RESEARCH_AND_PLANNING.md or RESEARCH_AND_IMPLEMENTATION.md in the representative trajectory. A dash means no write was found.</p>

@@ -46,6 +46,17 @@ def sample_row():
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_fit_uses_rp_complete_step(self):
+        row = sample_row()
+        row["leading_rp"] = 100
+        row["rp_complete_step"] = 20
+        self.assertEqual(GENERATOR.fit_for_pilot(row), "NO")
+        row["leading_rp"] = 0
+        row["rp_complete_step"] = 21
+        self.assertEqual(GENERATOR.fit_for_pilot(row), "YES")
+        row["rp_complete_step"] = None
+        self.assertEqual(GENERATOR.fit_for_pilot(row), "NO")
+
     def test_shape_and_global_review_names(self):
         self.assertTrue(GENERATOR.is_global_review("Grader Coverage"))
         self.assertTrue(GENERATOR.is_global_review("[Blocking] Grader coverage"))
