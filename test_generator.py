@@ -46,6 +46,32 @@ def sample_row():
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_shape_and_global_review_names(self):
+        self.assertTrue(GENERATOR.is_global_review("Grader Coverage"))
+        self.assertTrue(GENERATOR.is_global_review("[Blocking] Grader coverage"))
+        self.assertTrue(
+            GENERATOR.ai_review_passes(
+                {
+                    "rubric_name": "[Blocking] Grader coverage",
+                    "status": "completed",
+                    "result": "Fail",
+                }
+            )
+        )
+        self.assertEqual(GENERATOR.shape_from_reviews(7, []), "Migration")
+        self.assertEqual(GENERATOR.shape_from_reviews(11, []), "Diagnosis")
+        self.assertEqual(GENERATOR.shape_from_reviews(13, []), "Optimization")
+
+    def test_argus_low_severity_findings_pass(self):
+        review = {
+            "status": "completed",
+            "result": "fail",
+            "finding_severities": ["info", "warning"],
+        }
+        self.assertEqual(GENERATOR.classify_argus(review), "Pass")
+        review["finding_severities"].append("error")
+        self.assertEqual(GENERATOR.classify_argus(review), "Fail")
+
     def test_normalizes_task_link(self):
         value = "https://horizon.bespokelabs.ai/tasks/4372a4af-85b5-40a5-a715-193f750486c2?tab=rubrics"
         self.assertEqual(
@@ -106,6 +132,48 @@ class GeneratorTests(unittest.TestCase):
                     "rp_complete_step": 2,
                 },
             )
+
+    def test_rp_metrics_ignores_false_and_unexecuted_writes(self):
+        data = {
+            "trajectories": [
+                {
+                    "actions": [
+                        {
+                            "ordinal": 1,
+                            "arguments": {
+                                "keystrokes": "open('/app/RESEARCH_AND_PLANNING.md', 'w').write('done')\n"
+                            },
+                            "observation": "New Terminal Output: done",
+                        },
+                        {
+                            "ordinal": 2,
+                            "arguments": {
+                                "keystrokes": "head RESEARCH_AND_PLANNING.md\npython3 -c \"open('diagnosis.json')\"\n"
+                            },
+                            "observation": "Current Terminal Screen: plan contents",
+                        },
+                        {
+                            "ordinal": 3,
+                            "arguments": {
+                                "keystrokes": "open('/app/RESEARCH_AND_PLANNING.md', 'w').write('later')\n"
+                            },
+                            "observation": "Previous response had parsing errors: ERROR: Invalid JSON",
+                        },
+                        {
+                            "ordinal": 4,
+                            "arguments": {
+                                "keystrokes": "p = pathlib.Path('/app/RESEARCH_AND_PLANNING.md'); p.write_text('final')\n"
+                            },
+                            "observation": "New Terminal Output: done",
+                        },
+                    ]
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trajectory.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(GENERATOR.rp_metrics(path)["rp_complete_step"], 4)
 
     def test_render_and_reload(self):
         with tempfile.TemporaryDirectory() as directory:

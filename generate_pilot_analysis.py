@@ -32,11 +32,11 @@ DEFAULT_TOOL_ROOT = Path.home() / "tool-call-clustering"
 DEFAULT_PORT = 15434
 MODEL_FILTER_SQL = "(e.model LIKE 'starfall%' OR e.model LIKE 'router-16a8dce2a6e7%')"
 GLOBAL_REVIEW_NAMES = {
-    "Grader Coverage",
-    "Argus Lite",
-    "Reward Hack",
-    "Static Checklist",
-    "Environment & Grading Lint",
+    "grader coverage",
+    "argus lite",
+    "reward hack",
+    "static checklist",
+    "environment & grading lint",
 }
 
 
@@ -383,6 +383,14 @@ def severities(value: Any) -> list[str]:
     elif isinstance(value, list):
         for nested in value:
             result.extend(severities(nested))
+    elif isinstance(value, str) and value.lower() in {
+        "critical",
+        "error",
+        "info",
+        "warning",
+        "warn",
+    }:
+        result.append(value.lower())
     return result
 
 
@@ -412,6 +420,21 @@ def shape_from_reviews(count: int, names: list[str]) -> str:
     return "Diagnosis"
 
 
+def is_global_review(name: str) -> bool:
+    base_name = re.sub(r"^\[[^]]+\]\s*", "", name).strip().casefold()
+    return base_name in GLOBAL_REVIEW_NAMES
+
+
+def ai_review_passes(review: dict[str, Any]) -> bool:
+    name = str(review.get("rubric_name", ""))
+    if re.sub(r"^\[[^]]+\]\s*", "", name).strip().casefold() == "grader coverage":
+        return True
+    return (
+        str(review.get("status", "")).lower() == "completed"
+        and result_is_pass(review.get("result"))
+    )
+
+
 def load_task_metadata(db: HorizonDatabase, task_ids: list[str]) -> dict[str, dict[str, Any]]:
     ids = sql_ids(task_ids)
     tasks = db.csv(
@@ -429,6 +452,11 @@ def load_task_metadata(db: HorizonDatabase, task_ids: list[str]) -> dict[str, di
                r.name AS rubric_name,
                ar.status::text AS status,
                ar.result::text AS result,
+               coalesce((
+                   SELECT jsonb_agg(f.severity::text ORDER BY f.finding_id)
+                   FROM rubric_ai_review_findings f
+                   WHERE f.rubric_ai_review_id = ar.id
+               ), '[]'::jsonb)::text AS finding_severities,
                row_to_json(ar)::text AS review_json
         FROM rubric_ai_reviews ar
         JOIN rubrics r ON r.id = ar.rubric_id
@@ -442,6 +470,7 @@ def load_task_metadata(db: HorizonDatabase, task_ids: list[str]) -> dict[str, di
         record["rubric_name"] = row["rubric_name"]
         record["status"] = row["status"]
         record["result"] = row["result"]
+        record["finding_severities"] = json.loads(row["finding_severities"])
         grouped[row["task_id"]].append(record)
 
     for task_id, item in found.items():
@@ -449,18 +478,22 @@ def load_task_metadata(db: HorizonDatabase, task_ids: list[str]) -> dict[str, di
         ai_reviews = [
             review
             for review in all_reviews
-            if review["rubric_name"] not in GLOBAL_REVIEW_NAMES
+            if not is_global_review(review["rubric_name"])
         ]
         ai_names = [review["rubric_name"] for review in ai_reviews]
+        grader_coverage_reviews = [
+            review
+            for review in all_reviews
+            if re.sub(r"^\[[^]]+\]\s*", "", review["rubric_name"])
+            .strip()
+            .casefold()
+            == "grader coverage"
+        ]
+        pass_reviews = ai_reviews + grader_coverage_reviews
         item["ai_count"] = len(ai_reviews)
         item["ai_rubrics"] = (
             "Pass"
-            if ai_reviews
-            and all(
-                str(review.get("status", "")).lower() == "completed"
-                and result_is_pass(review.get("result"))
-                for review in ai_reviews
-            )
+            if pass_reviews and all(ai_review_passes(review) for review in pass_reviews)
             else "Fail"
         )
         item["shape"] = shape_from_reviews(len(ai_reviews), ai_names)
@@ -719,12 +752,44 @@ def merge_and_finalize(output: Path, annotation_tool: Path, tool_root: Path) -> 
     )
 
 
-WRITE_PATTERN = re.compile(
-    r"(?:write_text\s*\(|open\s*\(|cat\s+<<|base64\s+-d\s*>|"
-    r">\s*(?:/app/|/workspace/repo/)?RESEARCH_AND_(?:PLANNING|IMPLEMENTATION)\.md|"
-    r"python3\s+(?:/tmp/|make_))",
-    re.IGNORECASE,
+RP_FILE_PATTERN = (
+    r"(?:/app/|/workspace/repo/)?"
+    r"RESEARCH_AND_(?:PLANNING|IMPLEMENTATION)\.md"
 )
+RP_WRITE_PATTERNS = [
+    re.compile(
+        rf"(?:pathlib\.)?Path\s*\(\s*(['\"]){RP_FILE_PATTERN}\1\s*\)"
+        r"\s*\.write_(?:text|bytes)\s*\(",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b([A-Za-z_]\w*)\s*=\s*(?:pathlib\.)?Path\s*\(\s*"
+        rf"(['\"]){RP_FILE_PATTERN}\2\s*\)\s*;?\s*\1"
+        r"\.write_(?:text|bytes)\s*\(",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"open\s*\(\s*(['\"]){RP_FILE_PATTERN}\1\s*,\s*"
+        r"(?:mode\s*=\s*)?(['\"])[^'\"]*[wax][^'\"]*\2\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:^|[\s;|&])>>?\s*(['\"]?){RP_FILE_PATTERN}\1",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\btee(?:\s+-a)?\s+(['\"]?){RP_FILE_PATTERN}\1",
+        re.IGNORECASE,
+    ),
+]
+
+
+def is_rp_write_action(action: dict[str, Any]) -> bool:
+    command = str((action.get("arguments") or {}).get("keystrokes", ""))
+    if not any(pattern.search(command) for pattern in RP_WRITE_PATTERNS):
+        return False
+    observation = str(action.get("observation", ""))
+    return "Previous response had parsing errors:" not in observation
 
 
 def rp_metrics(annotated_path: Path) -> dict[str, Any]:
@@ -748,11 +813,7 @@ def rp_metrics(annotated_path: Path) -> dict[str, Any]:
         leading += 1
     completion_steps = []
     for action in actions:
-        command = str((action.get("arguments") or {}).get("keystrokes", ""))
-        if (
-            re.search(r"RESEARCH_AND_(?:PLANNING|IMPLEMENTATION)\.md", command)
-            and WRITE_PATTERN.search(command)
-        ):
+        if is_rp_write_action(action):
             completion_steps.append(int(action.get("ordinal", 0)))
     return {
         "leading_rp": leading,
