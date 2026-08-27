@@ -56,6 +56,8 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(GENERATOR.fit_for_pilot(row), "YES")
         row["rp_complete_step"] = None
         self.assertEqual(GENERATOR.fit_for_pilot(row), "NO")
+        row["leading_rp"] = 21
+        self.assertEqual(GENERATOR.fit_for_pilot(row), "YES")
 
     def test_shape_and_global_review_names(self):
         self.assertTrue(GENERATOR.is_global_review("Grader Coverage"))
