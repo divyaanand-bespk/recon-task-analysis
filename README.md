@@ -38,7 +38,7 @@ money (about $11 from a completely cold start, near zero warm).
 
 The script accepts Horizon task IDs or task links and creates a self-contained HTML report. It keeps the tasks already present in the output file and adds or refreshes the supplied tasks. The first run starts with only the supplied tasks unless you pass an existing report with `--base-html`.
 
-Three further scripts sit around it. `diversity_enrich.py` attaches the repository and language of each task, which the database does not hold. `render_report.py` turns the JSON sidecar into a report without querying Horizon again. `select_pilot.py` picks the best N tasks under diversity caps. All four read every credential from the environment and none of them write to Horizon.
+Several scripts sit around it. `diversity_enrich.py` attaches the repository and language of each task, which the database does not hold. `version_materiality.py` decides whether a superseded version's evidence still counts. `render_report.py`, `golden_app.py` and `make_report.py` turn the JSON sidecar into the three reports without querying Horizon again. `select_pilot.py` is the older cap-based selector and is no longer part of the run. `run_pilot.sh` drives the whole sequence and `preflight.sh` checks the preconditions. Every one reads its credentials from the environment, and none of them writes to Horizon.
 
 ## Requirements
 
@@ -111,25 +111,33 @@ python3 generate_pilot_analysis.py --task-file new-task-ids.txt --port 15433 --o
 
 ## The run sequence
 
-Enrichment first, because the analysis reads its output. Rendering last, and repeatable on its own.
+**Use `./run_pilot.sh` instead of these steps.** It runs all of them in order, including the materiality stage that the sequence below omits, and it is what produced the shipped handover. The stages are listed only for debugging one of them.
+
+`$PY` below is the interpreter `preflight.sh` discovers: the macOS system `python3` is 3.9 and has no `tomllib`, so `diversity_enrich.py` dies on its import line if you use it.
 
 ```bash
+source ./preflight.sh          # sets $PY, PATH for psql, the key and the DB role
+
 # 1. Repository, language and content fingerprint per task, from the API.
-export HORIZON_API_KEY=...
-# Cached per (task, version) under ~/.cache/pilot-analysis/enrich, so re-runs are near-free.
-python3 diversity_enrich.py --task-file new-task-ids.txt --out ~/Downloads/enrich.json
+"$PY" diversity_enrich.py --task-file new-task-ids.txt --out /tmp/enrich.json
 
-# 2. The measurement pass. Talks to the database, exports trajectories, labels R/P.
-export HORIZON_DB_ROLE=horizon_claude_ro
-export HORIZON_DB_SECRET=horizon-claude-ro-password
-python3 generate_pilot_analysis.py \
-  --task-csv ~/Downloads/pilot-sheet.csv \
-  --enrich ~/Downloads/enrich.json \
+# 2. Which superseded versions still count. run_pilot.sh builds pairs.json itself.
+"$PY" version_materiality.py --pairs /tmp/pairs.json --out /tmp/materiality.json
+
+# 3. The measurement pass. Talks to the database, exports trajectories, labels R/P.
+#    Omitting --materiality makes the report staleness-blind; omitting --assume-fit
+#    gates it. run_pilot.sh passes both.
+"$PY" generate_pilot_analysis.py \
+  --task-csv /path/to/sheet.csv \
+  --enrich /tmp/enrich.json --materiality /tmp/materiality.json --assume-fit \
   --port 15433 --jobs 12 --label-concurrency 16 \
-  --output ~/Downloads/pilot-report.html
+  --output /tmp/pilot.html
 
+# 4. The three reports, from the sidecar. No Horizon access.
 # 3. Re-render the report from the sidecar. No Horizon access.
-python3 render_report.py ~/Downloads/pilot-report.json -o ~/Downloads/pilot-report.html
+"$PY" render_report.py /tmp/pilot.json -o out/pilot-readiness.html --target 50
+"$PY" golden_app.py    /tmp/pilot.json -o out/golden-set.html
+"$PY" make_report.py   /tmp/pilot.json -o out/handover.html
 
 # 4. Optional: pick the pilot set under the diversity caps.
 python3 select_pilot.py \
@@ -184,7 +192,9 @@ The parser is driven by the header text, not by column position. It matches "rea
 
 ### Fit for pilot
 
-All five gates must hold.
+`run_pilot.sh` includes EVERY task by default (`--assume-fit`) and computes only the order; the gates below apply only when you pass `--gated`. Every signal is measured and reported either way.
+
+When gated, all five gates must hold.
 
 1. AI rubrics `Pass`.
 2. Pass@6 below 2.
@@ -196,23 +206,30 @@ All five gates must hold.
 
 Two different things are called a version, and only one of them inherits.
 
-- A Horizon **task version** never inherits. The latest version is always the one read. An older version passing does not excuse the current one.
+- A Horizon **task version** does NOT inherit in principle -- an older version passing does not excuse the current one. But the measurement pass does not enforce that on its own: it takes the newest row that EXISTS, without comparing it to the task's current version. Measured on the 99-id sheet, 11 of the 58 ids carrying rubric rows have ZERO rows on their current version, so those verdicts describe a version nobody runs. `version_materiality.py` plus `--materiality` is what makes the distinction real: a verdict from a version whose material files are byte-identical carries forward, one from a materially changed version stops counting. `run_pilot.sh` always passes it.
 - A CSV **variant** does inherit, because the same rubric is re-fired against each shipped variant.
 
 Rubrics and rollouts resolve independently, because a task routinely carries its rubrics on one variant and its rollouts on another. Within a variant, only the latest run of a rubric counts; retired rubric sets leave stale rows behind, and one task in this batch carries 31 rubric rows of which 19 are history. Across variants, in CSV order `final` then `binary` then `partial`, the first variant whose latest run passes settles that rubric. If none passes, the most recent failing run is reported. Every borrowed signal records the variant it came from, so any verdict can be audited back to the task ID that supplied the evidence.
 
 ### Diversity
 
-Diversity is a property of the pool, not of a task, so it is not part of `fit_for_pilot`. Two individually perfect tasks can still be a bad pair. Eligibility is decided per task, then `select_pilot.py` applies the caps while walking the eligible list: no repository above `--max-per-repo`, no language above `--max-lang-share` of the selection, and identical content fingerprints collapsed. A shortfall is reported rather than traded away. If N cannot be reached without breaching a cap, the selection stops short and says so.
+Diversity is a property of the pool, not of a task, so it is not part of `fit_for_pilot`. Two individually perfect tasks can still be a bad pair.
+
+Ordering is `diverse_order()` in `render_report.py`: **farthest-first traversal**. Each pick is the task whose distance to its NEAREST already-picked task is largest, where distance is the number of axes -- language, shape, repository -- on which two tasks disagree. Ties, common because distance is only ever 0-3, break on balance: the summed per-axis usage of the task's values. Then rollouts, median turns, original position. The seed is the rarest combination in the pool.
+
+Running out of options is not failure. When nothing distant remains it takes the least similar task left rather than stopping, so the list still reaches its target; repeats at the tail mean the pool ran out.
+
+`select_pilot.py` is the older cap-based selector (`--max-per-repo`, `--max-lang-share`). **`run_pilot.sh` does not use it** and it plays no part in the shipped ordering.
 
 ## Caches
 
-Two caches make a re-run cheap. Both are on by default and both are keyed so that a stale entry cannot be served for changed content.
+Three caches make a re-run cheap. All are on by default and all are keyed so that a stale entry cannot be served for changed content. None of them travels with the repository, so a fresh clone pays a cold start.
 
 | Cache | Location | Key | Off with |
 | --- | --- | --- | --- |
 | R/P labels | `~/.cache/pilot-analysis/rp` | rollout ID | `--no-rp-cache` |
 | Enrichment | `~/.cache/pilot-analysis/enrich` | task ID and version | `--no-cache` |
+| Version digests | `~/.cache/pilot-analysis/materiality` | task ID and version | delete the directory |
 
 R/P labelling is the only step that costs money, so its cache is the one that matters: adding 5 tasks to a 156-task sheet pays for 5 tasks of labelling, not 156. Point `--rp-cache` elsewhere to use a different directory, and `--seed-rp-cache` adopts annotations already sitting in `runs/` so work done before the cache existed is not paid for twice.
 
@@ -260,7 +277,11 @@ The diagnostics distinguish a **forced** pick, where no alternative existed on t
 | `generate_pilot_analysis.py` | The measurement pass. Talks to the database, exports trajectories, labels R/P, writes HTML and a JSON sidecar. |
 | `diversity_enrich.py` | Repository, language and fingerprint per task, from the API. |
 | `render_report.py` | Renders the sidecar as a standalone report. |
-| `select_pilot.py` | Diversity-constrained selection of the best N. |
+| `select_pilot.py` | The older cap-based selector. Not used by `run_pilot.sh`. |
+| `make_report.py` | Renders the shareable handover page from the sidecar. |
+| `version_materiality.py` | Decides whether a version bump changed anything that could alter an outcome. |
+| `run_pilot.sh` | The whole pipeline, from a sheet path to the three reports. |
+| `preflight.sh` | Checks every precondition and prints the exact fix for each failure. |
 | `golden_app.py` | Renders the selected golden set and why each task was picked at its position. |
 | `test_generator.py` | Tests for the generator. |
 

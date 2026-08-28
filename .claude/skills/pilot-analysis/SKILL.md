@@ -88,6 +88,13 @@ it in a file instead of pasting it into the conversation.
 
 ## The stages, if you need to run one by hand
 
+**These are for debugging ONE stage. Use `./run_pilot.sh` to produce a report.**
+Run by hand and it is easy to omit `--materiality`, which makes the result
+staleness-blind -- the exact failure the Staleness section below calls the one
+thing that will mislead you -- or `--assume-fit`, which silently gates a list
+that was meant to include everything. `run_pilot.sh` passes both, and also runs
+the materiality stage and `make_report.py`, neither of which appears below.
+
 Enrichment first — the analysis reads its output. Rendering last, and repeatable
 on its own with no Horizon access at all.
 
@@ -115,8 +122,9 @@ $PY golden_app.py    /tmp/pilot.json -o /tmp/golden-set.html
 
 ## The caches are local, and that matters for handover
 
-`~/.cache/pilot-analysis/` holds two caches: `enrich/` (per task+version) and
-`rp/` (research-and-planning labels, ~29MB). **Neither travels with this repo**,
+`~/.cache/pilot-analysis/` holds THREE caches: `enrich/` (per task+version),
+`rp/` (research-and-planning labels, ~29MB) and `materiality/` (per task+version
+file digests). **None of them travels with this repo**,
 so a fresh clone pays a cold start. Neither is required for correctness — they
 only avoid re-paying. `/tmp/pilot_enrich.json` does not travel either; it is
 easy to assume that sidecar counts as a cache, and it does not.
@@ -126,6 +134,7 @@ Measured on the 53-group / 99-task-id sheet:
 | step | cold | warm | bills you |
 |---|---|---|---|
 | enrichment | 99 API fetches, ~50s at `--workers 16` | cached | no |
+| version materiality | ~70s, 22 listing calls | cached | no |
 | database pass | 13s | 3s | no |
 | R/P labelling | ~250 chunks over 59 rollouts, **~$11** | cached | **yes** |
 
@@ -219,8 +228,9 @@ question the list already answered.
 resolved, and a "Blocked by" reason for every task that misses. This is the
 measurement view.
 
-`golden_app.py` -> **Golden Set**: the fit pool in pick order under the strategy
-below, with a cut line at `--target` (default 50) and everything past it kept as
+`golden_app.py` -> **Golden Set**: the pool in pick order under the strategy
+above, with a cut line at the module constant `TARGET` (default 50; there is no
+command-line flag for it) and everything past it kept as
 ranked reserves. Each pick shows, per axis, whether it OPENED that axis, REPEATED
 it by choice, or REPEATED it because nothing unused was left -- so a reader can
 tell an unavoidable repeat from a chosen one. The page replays the key
@@ -303,6 +313,35 @@ Two earlier sources were both wrong and are worth not re-inventing:
 when rubrics were merged across variants; `task.toml`'s `category` describes the
 change type (bugfix / feature_request), not the family.
 
+## Research and planning: three numbers, not one
+
+`rp_metrics()` returns three different measures and they are easy to confuse. A
+report that shows one of them under a bare "R/P" heading WILL be misread -- that
+already happened once.
+
+| field | what it counts |
+|---|---|
+| `leading_rp` | the UNBROKEN run of research/planning actions from action #1. Stops at the first action that is not one, so a task that researched later reads 0. This is Avi's `leading()` from `phase_profile.py`. |
+| `total_rp` | every research/planning action anywhere in the trajectory |
+| `rp_complete_step` | the ordinal of the last action that WROTE `RESEARCH_AND_PLANNING.md`, or absent if no write was detected |
+
+Real example: benthos has `leading_rp` 0 and `total_rp` 206 across 323 actions.
+Its first action was not research; it did plenty afterwards. Reported as a lone
+"R/P: 0" that reads as "did no research", which is the opposite of true.
+
+`fit_for_pilot()` gates on `rp_complete_step` when present and falls back to
+`leading_rp` only when it is absent.
+
+**Known blind spot.** `is_rp_write_action()` matches literal
+`Path(...).write_text()` and `open(..., "w")` idioms in the command text. An
+agent that writes the artifact another way is missed. Measured: of the 14 tasks
+with no detected write, 13 never mention the artifact anywhere -- genuinely
+absent -- but ONE (httpx2) wrote it through a `python3 -c "import base64..."`
+command and was only visible because it later ran `head` on the file in plain
+text. So an absent completion step is right about 52 times in 53. Widening the
+patterns would change that task's gated verdict, so it is a deliberate open
+question rather than an oversight.
+
 ## Traps that have actually bitten
 
 - **A broken query returns empty, and empty reads as good news.** Any filter or
@@ -333,7 +372,7 @@ Where things live, so a change lands in one place and not three.
 | A new measured column | the SQL in `load_task_metadata()`, then surface it in the renderer | re-run |
 | Owner to shape mapping | `SHAPE_BY_OWNER` in `generate_pilot_analysis.py` | re-run |
 | Which files count as material | `MATERIAL` in `version_materiality.py` | delete `~/.cache/pilot-analysis/materiality`, re-run |
-| The pilot cut size | `TARGET` in `make_report.py`, `--target` for `render_report.py` | re-render |
+| The pilot cut size | THREE places: `TARGET` in `make_report.py`, `TARGET` in `golden_app.py` (no flag), and `--target` for `render_report.py` | re-render all three, or they disagree |
 
 **THE SELECTION KEY EXISTS TWICE.** `render_report.diverse_order()` produces the
 order; `golden_app.key_tuple()` re-derives it to explain each pick and

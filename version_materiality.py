@@ -23,7 +23,8 @@ no grader. `tests/sealed.json` is a CONSEQUENCE of a change, never a cause --
 including it would make every cosmetic edit look material.
 
 Measured on the 99-id sheet: of 11 tasks whose evidence sat on a superseded
-version, 3 were cosmetic (a rubrics.json addition) and 8 had a changed grade.py.
+version, 3 were equivalent and 8 material. In all 8 `environment/Dockerfile`
+changed; `tests/grade.py` changed in 7 of them.
 """
 from __future__ import annotations
 import argparse, concurrent.futures as cf, hashlib, json, os, sys, urllib.request
