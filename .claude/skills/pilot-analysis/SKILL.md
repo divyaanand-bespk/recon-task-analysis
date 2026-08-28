@@ -139,6 +139,17 @@ ENFORCED for the partial one.
 `ai_rubrics == "Pass"` AND `argus_main == "Pass"` AND `pass6 < 2` AND
 `pass6_denominator > 0` AND `rp_gate > 20`.
 
+**`--assume-fit` turns all of that off.** Every task in the sheet then counts as
+fit and selection is decided by DIVERSITY ALONE. Every signal is still measured
+and still reported -- rubrics, Argus, pass6, rollouts, turns, research-and-planning
+all keep their columns -- they just stop excluding anything.
+
+Use it when the sheet's owners say the list is already vetted and they want the
+whole thing ordered rather than filtered. That was the state of the final
+handover: 53 tasks in, 53 tasks out. It is a decision by the people who own the
+sheet, NOT a claim by this pipeline that every task passes, so say which mode
+produced a report whenever you present one.
+
 ## The selection strategy
 
 `diverse_order()` in `render_report.py` orders the fit pool. Five terms:

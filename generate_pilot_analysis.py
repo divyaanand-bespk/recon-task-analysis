@@ -83,6 +83,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--assume-fit",
+        action="store_true",
+        help="Treat every task in the sheet as fit for pilot. Drops the AI-rubric, "
+             "Argus Main, pass6 and research-and-planning GATES; every one of those "
+             "signals is still measured and still reported, it just no longer "
+             "excludes a task. Selection then depends only on diversity.",
+    )
+    parser.add_argument(
         "--materiality",
         default="",
         help="version_materiality.py output. A rubric verdict produced against a "
@@ -1384,7 +1392,18 @@ def rp_metrics(annotated_path: Path) -> dict[str, Any]:
     }
 
 
+# When true, every task in the sheet counts as fit and selection is decided by
+# DIVERSITY ALONE. Set by --assume-fit. The quality signals are still measured
+# and still reported -- rubrics, Argus, rollouts, turns and research-and-planning
+# all keep their columns -- they simply stop being gates. This is a deliberate
+# decision by the sheet's owners that the list has already been vetted, not a
+# claim by this script that every task passes.
+ASSUME_FIT = False
+
+
 def fit_for_pilot(item: dict[str, Any]) -> str:
+    if ASSUME_FIT:
+        return "YES"
     complete_step = item.get("rp_complete_step")
     rp_gate = (
         int(complete_step)
@@ -2076,6 +2095,8 @@ def main() -> None:
     stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
     run_dir = args.run_dir or Path(__file__).resolve().parent / "runs" / stamp
     run_dir.mkdir(parents=True, exist_ok=False)
+    if args.assume_fit:
+        globals()["ASSUME_FIT"] = True
     started = time.perf_counter()
     try:
         with HorizonDatabase(args.port) as db:
