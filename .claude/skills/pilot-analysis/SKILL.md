@@ -203,9 +203,40 @@ Rollouts attach through `local_task_id`, NOT `task_id` (`task_id` is null on
 these rows), and their version comes from `task_versions.version_number` via
 `rollouts.task_version_id`.
 
-**So: after anyone pushes a task version, that task's numbers in the report are
-stale until its rubrics and rollouts are re-run.** Say so when reporting, and
-quote the version with the verdict.
+### Not every push invalidates the evidence
+
+A version bump is not automatically a reset. Adding `tests/rubrics.json` changes
+nothing an agent sees or a grader reads, so the previous version's verdicts stay
+true; rewriting `grade.py` makes every one of them worthless. Treating both the
+same way either discards good evidence or trusts bad evidence.
+
+`version_materiality.py` decides by CONTENT. Two versions are equivalent when
+every file that could change an outcome is byte-identical: the repository
+tarball, both Dockerfiles, `grade.py`, `test.sh`, `private_manifest.json`,
+`instruction.md`, `task.toml`. `rubrics.json` is excluded because no grader
+reads it, and `sealed.json` because it is a CONSEQUENCE of a change rather than
+a cause -- counting it would make every cosmetic edit look material.
+
+```bash
+# pairs.json: [{"task_id":..., "evidence_version":N, "current_version":M}, ...]
+$PY version_materiality.py --pairs pairs.json --out /tmp/materiality.json
+$PY generate_pilot_analysis.py ... --materiality /tmp/materiality.json
+```
+
+With the flag, a verdict from a materially-changed version stops counting and
+the rubric column reads `None` (no current evidence) rather than a borrowed
+Pass or Fail. A verdict from an equivalent version carries forward untouched.
+Tasks absent from the file are left alone, so the flag is optional and the
+default is unchanged.
+
+Measured on the 99-id sheet: 11 tasks had evidence on a superseded version --
+**3 equivalent, 8 with a changed `grade.py`**. Enforcing it moved the fit pool
+by exactly one task (36 -> 35), so it costs almost nothing and removes a whole
+class of wrong answer. Digests are cached per (task, version) under
+`~/.cache/pilot-analysis/materiality`; content at a version is immutable, so a
+cache hit never needs revalidating.
+
+**When reporting, quote the version with the verdict.**
 
 ## Shape
 

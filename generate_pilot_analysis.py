@@ -83,6 +83,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--materiality",
+        default="",
+        help="version_materiality.py output. A rubric verdict produced against a "
+             "version whose MATERIAL files differ from the current one stops "
+             "counting; one from a version that is byte-identical where it matters "
+             "carries forward.",
+    )
+    parser.add_argument(
         "--enrich",
         type=Path,
         help="diversity_enrich.py output, adding repository and language per task.",
@@ -1443,6 +1451,37 @@ def seed_rp_cache_from_runs(runs_root: Path, cache_dir: Path) -> int:
     return adopted
 
 
+def drop_stale_reviews(metadata: dict[str, dict[str, Any]],
+                       materiality: dict[str, Any]) -> None:
+    """Discard rubric verdicts that were produced against a DIFFERENT task.
+
+    A verdict is evidence about the version it ran on. When a later push changed
+    something material -- grade.py, the repository, the instructions -- the old
+    verdict describes a task nobody is running any more, and reporting it as the
+    current answer is simply wrong. When the push changed nothing material (a
+    rubrics.json addition, say) the verdict is still true and throwing it away
+    would discard real work and real spend.
+
+    So this drops a review only when version_materiality.py judged the bump
+    MATERIAL. Tasks absent from that file are left completely alone, which keeps
+    the flag optional and the default behaviour unchanged.
+    """
+    for task_id, record in metadata.items():
+        verdict = materiality.get(task_id)
+        if not verdict or verdict.get("equivalent"):
+            continue
+        current = verdict.get("current_version")
+        if current is None:
+            continue
+        kept = [r for r in (record.get("ai_reviews") or [])
+                if str(r.get("task_version")) == str(current)]
+        dropped = len(record.get("ai_reviews") or []) - len(kept)
+        if dropped:
+            record["ai_reviews"] = kept
+            record["stale_reviews_dropped"] = dropped
+            record["stale_reason"] = ", ".join(verdict.get("changed") or []) or "material change"
+
+
 def analyse_tasks(
     db: HorizonDatabase,
     task_ids: list[str],
@@ -1452,8 +1491,10 @@ def analyse_tasks(
     jobs: int = 12,
     label_concurrency: int = 16,
     rp_cache: Path | None = None,
+    materiality: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     metadata = load_task_metadata(db, task_ids, jobs=jobs)
+    drop_stale_reviews(metadata, materiality or {})
     rollout_data = load_rollouts(db, task_ids, jobs=jobs)
     # Directory names are assigned serially -- collision handling depends on what
     # has been claimed so far -- but the exports themselves are independent.
@@ -2038,6 +2079,8 @@ def main() -> None:
     started = time.perf_counter()
     try:
         with HorizonDatabase(args.port) as db:
+            materiality = (json.loads(Path(args.materiality).read_text())
+                           if args.materiality else {})
             new_rows = analyse_tasks(
                 db,
                 task_ids,
@@ -2047,6 +2090,7 @@ def main() -> None:
                 jobs=args.jobs,
                 label_concurrency=args.label_concurrency,
                 rp_cache=rp_cache,
+                materiality=materiality,
             )
         enrich: dict[str, dict[str, Any]] = {}
         if getattr(args, "enrich", None) and args.enrich.is_file():
