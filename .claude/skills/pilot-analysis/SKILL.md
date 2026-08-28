@@ -161,6 +161,52 @@ self-checks that replaying it reproduces the order. **If you change the key in
 one file you must change it in both**, then confirm the page does not say
 "local fallback" or "did not reproduce".
 
+## What the two reports are
+
+`render_report.py` -> **Pilot Readiness**: every task in the sheet, each fit gate
+resolved, and a "Blocked by" reason for every task that misses. This is the
+measurement view.
+
+`golden_app.py` -> **Golden Set**: the fit pool in pick order under the strategy
+below, with a cut line at `--target` (default 50) and everything past it kept as
+ranked reserves. Each pick shows, per axis, whether it OPENED that axis, REPEATED
+it by choice, or REPEATED it because nothing unused was left -- so a reader can
+tell an unavoidable repeat from a chosen one. The page replays the key
+independently and self-checks; if it says "local fallback" or "did not
+reproduce", the two implementations have diverged and the order is not trustworthy.
+
+Both render from the JSON sidecar (`/tmp/pilot.json`), so re-rendering after a
+strategy change needs no Horizon access and no spend.
+
+## Staleness: THE ONE THING THAT WILL MISLEAD YOU
+
+Rubric rows and rollouts are keyed to a task VERSION. Pushing a new version does
+not delete them -- the old rows remain and stay readable -- but they now describe
+a version nobody is running. **A stale PASS is not a current PASS.**
+
+`generate_pilot_analysis.py` currently takes the newest row that EXISTS and does
+not compare it to the task's current version, so a task whose current version has
+an entirely empty board still reports `ai_rubrics=Pass` and counts as fit.
+Measured on the 99-id sheet: **11 of the 58 ids with any rubric rows have zero
+rows on their current version.**
+
+To check, query the view that already computes this -- do not re-derive it:
+
+```sql
+SELECT task_id, current_task_version, count(*) AS rows,
+       count(*) FILTER (WHERE task_version = current_task_version) AS on_current
+FROM rubric_ai_reviews_with_staleness
+WHERE task_id::text IN (...) GROUP BY 1,2;
+```
+
+Rollouts attach through `local_task_id`, NOT `task_id` (`task_id` is null on
+these rows), and their version comes from `task_versions.version_number` via
+`rollouts.task_version_id`.
+
+**So: after anyone pushes a task version, that task's numbers in the report are
+stale until its rubrics and rollouts are re-run.** Say so when reporting, and
+quote the version with the verdict.
+
 ## Shape
 
 Owner first, mini-batch name as fallback. Each author publishes exactly one
