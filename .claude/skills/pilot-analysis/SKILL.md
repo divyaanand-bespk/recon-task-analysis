@@ -341,6 +341,10 @@ self-checks that replaying it reproduces the order. Change one without the other
 and the golden page silently says "local fallback" or "did not reproduce" and its
 explanations become fiction. After any ordering change:
 
+This reads `out/work/pilot.json`, so **run `./run_pilot.sh` at least once first**
+-- on a fresh clone it does not exist yet and you get a bare `FileNotFoundError`.
+Re-rendering and re-checking after that costs nothing and touches nothing remote.
+
 ```bash
 source ./preflight.sh          # sets $PY; plain `python` is often not on PATH
 "$PY" - <<'EOF'
@@ -362,7 +366,8 @@ EARLIER than the floor means diversity was spent that did not have to be.
 
 **Re-rendering is free.** `render_report.py`, `golden_app.py` and
 `make_report.py` all read `out/work/pilot.json` and touch nothing remote, so
-iterate on presentation without re-measuring or re-spending.
+iterate on presentation without re-measuring or re-spending. All three were
+verified to run from a fresh clone against an existing sidecar.
 
 **Before changing the ordering, reproduce the current behaviour on a synthetic
 pool first.** Two faults have already hidden in this key, and both were only
