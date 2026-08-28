@@ -698,6 +698,60 @@ def classify_argus(record: dict[str, Any] | None) -> str:
     return "Fail"
 
 
+SHAPE_BY_BATCH = (
+    ("deepswe", "DeepSWE"),
+    ("migration", "Migration"),
+    ("optimization", "Optimization"),
+    ("diagnosis", "Diagnosis"),
+)
+
+
+SHAPE_BY_OWNER = {
+    "robert": "DeepSWE",
+    "umer": "Optimization",
+    "avi": "Optimization",
+    "zac": "Diagnosis",
+    "zach": "Diagnosis",
+    "kunj": "Diagnosis",
+    "divya": "Diagnosis",
+    "kartik": "Migration",
+}
+
+
+def shape_from_owner(responsible: str) -> str:
+    """Owner IS the shape: each author publishes exactly one family.
+
+    This is the authoritative source. The batch name below is a fallback,
+    because variants sit in PAIRED batches and one of each pair is a delivery
+    batch (alpharecon-gemini-binary) that names no shape at all -- so a task
+    whose only mapped variant landed in the delivery batch has no batch to read.
+    Owner has no such gap. Both spellings of Zac/Zach are accepted since the
+    sheet and the roster disagree.
+    """
+    key = (responsible or "").strip().casefold()
+    return SHAPE_BY_OWNER.get(key, "")
+
+
+def shape_from_batch(batch_name: str) -> str:
+    """The mini-batch a task lives in IS its shape -- that is how the project
+    organises them, so it is authoritative rather than inferred.
+
+    Two earlier sources were both wrong. shape_from_reviews() keyed on the NUMBER
+    of applicable rubrics ({7: Migration, 11: Diagnosis, 13: Optimization}), which
+    broke the moment rubrics were merged across variants: the counts moved and
+    every task fell through to the "Diagnosis" default. task.toml's `category` is
+    closer but describes the change type (bugfix / feature_request), not the family.
+
+    Variants live in PAIRED batches -- alpharecon-deepswe and
+    alpharecon-deepswe-binary are one family -- so match on substring.
+    """
+    lowered = (batch_name or "").casefold()
+    for needle, shape in SHAPE_BY_BATCH:
+        if needle in lowered:
+            return shape
+    return batch_name or "Unknown"
+
+
 def shape_from_reviews(count: int, names: list[str]) -> str:
     exact = {7: "Migration", 11: "Diagnosis", 13: "Optimization"}
     if count in exact:
@@ -1864,6 +1918,24 @@ def collapse_variants(rows: list[dict[str, Any]],
         merged["repo_key"] = (facts or {}).get("repo_key", "")
         merged["lang_key"] = (facts or {}).get("lang_key", "")
         merged["base_commit"] = (facts or {}).get("base_commit", "")
+        merged["category"] = (facts or {}).get("category", "")
+        # SHAPE FROM WHICHEVER VARIANT SITS IN A SHAPE-BEARING BATCH.
+        # Variants are split across paired batches, and one of the pair is a
+        # DELIVERY batch (alpharecon-gemini-binary) that names no shape at all.
+        # Taking the batch of whichever variant happened to supply rubrics leaves
+        # a delivery batch masquerading as a shape, so prefer any variant whose
+        # batch actually maps.
+        by_owner = shape_from_owner(merged.get("responsible", ""))
+        if by_owner:
+            merged["shape"] = by_owner
+            merged["shape_source"] = "owner"
+        else:
+            for _, variant_id in present:
+                candidate = shape_from_batch(by_id[variant_id].get("batch_name", ""))
+                if candidate in {shape for _, shape in SHAPE_BY_BATCH}:
+                    merged["shape"] = candidate
+                    merged["shape_source"] = "batch"
+                    break
         merged["fit"] = fit_for_pilot(merged)
         collapsed.append(merged)
     return collapsed

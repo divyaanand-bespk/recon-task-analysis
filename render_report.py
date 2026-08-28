@@ -50,123 +50,136 @@ def axis_value(row: dict, field: str) -> str:
     return UNKNOWN if v in (None, "") else str(v)
 
 
+
 def diverse_order(rows: list[dict]) -> tuple[list[dict], dict]:
-    """Order fit-for-pilot tasks so every axis of variety survives as long as possible.
+    """Order fit-for-pilot tasks so each pick differs on AS MANY AXES AS POSSIBLE.
 
-    The key is lexicographic, and the order of its terms IS the policy:
+    WHY NOT LEXICOGRAPHIC. The previous key ranked the axes -- language, then
+    shape, then repository -- so language was absolutely dominant: a task that
+    opened an unused language won even when it repeated both the shape and the
+    repository of the pick before it. Given a thousand Diagnosis tasks in one
+    Python repository spread over many languages, that key would cycle languages
+    forever and never leave the repository or the shape. Repositories are also
+    multi-language, so language freshness does not imply repository freshness.
 
-      1. least-used LANGUAGE      rotate every language before any repeats
-      2. least-used SHAPE         then every shape before any repeats
-      3. least-used REPOSITORY    then every repository before any repeats
-      4. most ELIGIBLE ROLLOUTS   among equally-varied picks, better-measured wins
-      5. highest MEDIAN TURNS     then the longer-horizon task
-      6. existing rank            exact ties only
+    WHAT THIS DOES INSTEAD, at every step:
 
-    Diversity terms lead, so variety is only ever spent when nothing unused is
-    left; the quality terms decide which of several equally-fresh candidates to
-    take. Once every axis is exhausted the remaining fit tasks still appear --
-    ranked by evidence -- rather than being dropped.
+      1. BREADTH   maximise how many axes the pick leaves UNUSED-so-far.
+                   A task fresh on all three beats one fresh on two, which beats
+                   one fresh on one. No axis outranks another.
+      2. PRESSURE  when nothing is fully fresh, minimise summed relative
+                   over-use. Each axis is scored against its OWN fair share --
+                   `used / (picks_so_far / distinct_values)` -- because raw
+                   counts are not comparable across axes: repeating one of two
+                   languages is unavoidable, repeating one of thirty-four
+                   repositories is waste. Normalising stops the widest axis
+                   dominating simply by having more values.
+      3. QUALITY   most eligible rollouts, then highest median turns.
+      4. RANK      exact ties only.
 
-    Greedy round-robin is deliberate, not incidental. Because it always takes
-    the least-used value, every PREFIX of the result maximises coverage: the
-    top-50 cut gets as many languages, shapes and repositories as any ordering
-    could put in 50 picks. Spreading a scarce language proportionally across the
-    whole list would read as more even, but it pushes half of that language past
-    the cut, so the pilot never sees it.
-
-    A repeat on a low-priority axis is not always a failure, and the two cases
-    have to be told apart:
-
-      FORCED  no task left in the pool carries an unused value on that axis.
-              Nothing could have been done; the pool simply ran out.
-      TRADED  an unused value did exist, but taking it would have spent a
-              HIGHER-priority axis, so the policy paid the cheaper repeat.
-
-    Returns the ordered rows and a diagnostics dict describing, per axis, how
-    much variety the pool actually held and when it ran out -- because "repeated
-    at pick 3" means something very different when the pool holds two languages
-    than when it holds twenty.
+    Diversity is therefore spent only when the pool genuinely offers nothing
+    fresher, and it is spent on whichever axis is least costly at that moment
+    rather than on a fixed pecking order.
     """
     pool = [dict(r) for r in rows if r.get("fit") == "YES"]
     for rank, row in enumerate(pool):
         row["_rank"] = rank
-
-    # Duplicate ids are a real hazard here: names and prefixes collide across
-    # source and delivered copies of a task. Removing the pick by id would drop
-    # every row sharing it, silently shrinking the golden set, so the pick is
-    # removed by identity and the collision is reported instead of swallowed.
-    ids = collections.Counter(r.get("task_id") for r in pool)
-    duplicate_ids = sorted(str(k) for k, n in ids.items() if n > 1 and k)
-
-    used = {field: collections.Counter() for field, _ in AXES}
+    total = len(pool)
     distinct = {field: len({axis_value(r, field) for r in pool}) for field, _ in AXES}
-    unknown_n = {field: sum(1 for r in pool if axis_value(r, field) == UNKNOWN)
-                 for field, _ in AXES}
-    first_repeat: dict[str, int | None] = {field: None for field, _ in AXES}
-    forced_n = {field: 0 for field, _ in AXES}
-    traded_n = {field: 0 for field, _ in AXES}
+    used = {field: collections.Counter() for field, _ in AXES}
+    traded_total = [0]
     ordered: list[dict] = []
 
     def key(r: dict):
-        return (used["lang_key"][axis_value(r, "lang_key")],
-                used["shape"][axis_value(r, "shape")],
-                used["repo_key"][axis_value(r, "repo_key")],
+        picks = len(ordered)
+        fresh = 0
+        pressure = 0.0
+        for field, _ in AXES:
+            value = axis_value(r, field)
+            count = used[field][value]
+            if count == 0:
+                fresh += 1
+            # fair share for this axis: how many picks each of its values would
+            # carry if the axis were spread perfectly across the picks so far.
+            share = max(1.0, picks / max(1, distinct[field]))
+            pressure += count / share
+        return (-fresh, pressure,
                 -int(r.get("rollouts_n") or 0),
                 -int(r.get("turns_median") or 0),
                 r["_rank"])
 
     while pool:
         pick = min(pool, key=key)
-        seq = len(ordered) + 1
-        for field, _ in AXES:
-            val = axis_value(pick, field)
-            fresh = used[field][val] == 0
-            pick[f"_{field}_fresh"] = fresh
-            pick[f"_{field}_unknown"] = val == UNKNOWN
-            if fresh:
-                pick[f"_{field}_why"] = "fresh"
+        pick["_fresh_axes"] = []
+        pick["_spent_axes"] = []
+        for field, label in AXES:
+            value = axis_value(pick, field)
+            n = used[field][value] + 1
+            if used[field][value] == 0:
+                pick["_fresh_axes"].append(label)
+                why = "fresh"
             else:
-                # Could any remaining candidate have kept this axis fresh?
-                avoidable = any(used[field][axis_value(c, field)] == 0 for c in pool)
-                pick[f"_{field}_why"] = "traded" if avoidable else "forced"
-                (traded_n if avoidable else forced_n)[field] += 1
-                if first_repeat[field] is None:
-                    first_repeat[field] = seq
-            used[field][val] += 1
-            pick[f"_{field}_n"] = used[field][val]
-        pick["_fresh"] = all(pick[f"_{f}_fresh"] for f, _ in AXES)
-        pick["_traded"] = any(pick[f"_{f}_why"] == "traded" for f, _ in AXES)
+                pick["_spent_axes"].append(f"{label} #{n}")
+                # TRADED vs FORCED. A repeat is only a choice if the pool still
+                # held an unused value on this axis. Under joint breadth a trade
+                # is deliberate: we gave up freshness HERE to gain more of it on
+                # the other axes. FORCED means the pool was exhausted -- nothing
+                # for the reader to fix.
+                why = ("traded" if any(used[field][axis_value(o, field)] == 0
+                                       for o in pool) else "forced")
+                if why == "traded":
+                    traded_total[0] += 1
+            pick[f"_{field}_why"] = why
+            pick[f"_{field}_n"] = n
+            used[field][value] += 1
+        pick["_new_lang"] = "Language" in pick["_fresh_axes"]
+        pick["_new_shape"] = "Shape" in pick["_fresh_axes"]
+        pick["_new_repo"] = "Repository" in pick["_fresh_axes"]
+        pick["_lang_n"] = used["lang_key"][axis_value(pick, "lang_key")]
+        pick["_shape_n"] = used["shape"][axis_value(pick, "shape")]
+        pick["_repo_n"] = used["repo_key"][axis_value(pick, "repo_key")]
+        pick["_repeat_lang"] = not pick["_new_lang"]
+        pick["_repeat_repo"] = not pick["_new_repo"]
+        pick["_fresh"] = len(pick["_fresh_axes"]) == len(AXES)
+        pick["_breadth"] = len(pick["_fresh_axes"])
         ordered.append(pick)
-        pool = [r for r in pool if r is not pick]
+        pool = [r for r in pool if r.get("task_id") != pick.get("task_id")]
 
-    axes = []
+    axes_diag = []
     for field, label in AXES:
         n = distinct[field]
-        # With n distinct values the earliest a repeat can possibly occur is
-        # pick n+1. Measuring the first repeat against that floor separates a
-        # weak ordering from a pool that never held the variety to begin with.
-        floor = n + 1
-        got = first_repeat[field]
-        axes.append({
-            "field": field, "label": label, "distinct": n, "floor": floor,
-            "first_repeat": got, "forced": forced_n[field], "traded": traded_n[field],
-            "unknown": unknown_n[field],
-            "optimal": got is None or got >= floor,
+        first_repeat = next((i + 1 for i, x in enumerate(ordered)
+                             if label not in x["_fresh_axes"]), None)
+        axes_diag.append({
+            "field": field, "label": label, "distinct": n,
+            # the earliest a repeat COULD happen: once every value is used once
+            "floor": min(n + 1, total) if n else 0,
+            "first_repeat": first_repeat,
+            "forced": sum(1 for x in ordered if x[f"_{field}_why"] == "forced"),
+            "traded": sum(1 for x in ordered if x[f"_{field}_why"] == "traded"),
+            "unknown": sum(1 for x in ordered if axis_value(x, field) == UNKNOWN),
+            "optimal": first_repeat is None or first_repeat >= min(n + 1, total),
             "degenerate": n <= 1,
         })
-    spent = [a for a in axes if a["first_repeat"]]
-    diag = {
-        "axes": axes,
-        "total": len(ordered),
-        "duplicate_ids": duplicate_ids,
-        "traded_picks": sum(1 for g in ordered if g["_traded"]),
-        # The first axis to run out, and the pick it ran out on -- the number a
-        # reader actually needs, rather than "something repeated at pick 2".
-        "first_spent": min(spent, key=lambda a: a["first_repeat"]) if spent else None,
-        "all_fresh_through": next((i for i, g in enumerate(ordered, 1)
-                                   if not g["_fresh"]), len(ordered) + 1) - 1,
+    # LEADING STREAK, not a total. The reader wants to know how deep the list
+    # stays perfect before any axis has to repeat -- a count scattered through
+    # the tail would not answer that.
+    streak = 0
+    for x in ordered:
+        if not x["_fresh"]:
+            break
+        streak += 1
+    counts = collections.Counter(r.get("task_id") for r in ordered)
+    return ordered, {
+        "axes": axes_diag,
+        "total": total,
+        "duplicate_ids": sorted(t for t, c in counts.items() if c > 1 and t),
+        "traded_picks": traded_total[0],
+        "all_fresh_through": streak,
+        "all_fresh_total": sum(1 for x in ordered if x["_fresh"]),
+        "first_spent": next((a for a in axes_diag if a["first_repeat"]), None),
+        "breadth": collections.Counter(x["_breadth"] for x in ordered),
     }
-    return ordered, diag
 
 
 def blockers(r: dict) -> list[str]:
@@ -214,6 +227,13 @@ def blockers(r: dict) -> list[str]:
     if gate <= 20:
         out.append(f"R/P gate {gate} (needs >20)")
     return out
+
+
+def model_state(m: dict | None) -> str:
+    """fails / solves / none — the filter compares this, not rendered text."""
+    if not m or not m.get("denominator"):
+        return "none"
+    return "fails" if m["pass6"] < 2 else "solves"
 
 
 def model_cell(m: dict | None) -> str:
@@ -375,7 +395,7 @@ def build(rows: list[dict], generated: str, target: int = 50) -> str:
         if why == "fresh":
             return '<span class="tag fresh">new</span>'
         if why == "traded":
-            return f'<span class="tag traded" title="an unused value was available; a higher-priority axis outranked it">#{n} traded</span>'
+            return f'<span class="tag traded" title="an unused value was available; the pick opened more ground on the other axes">#{n} traded</span>'
         return f'<span class="tag forced" title="no unused value remained in the pool">#{n} forced</span>'
 
     grows = []
@@ -452,7 +472,15 @@ def build(rows: list[dict], generated: str, target: int = 50) -> str:
         pm = r.get("per_model") or {}
         why = "; ".join(blockers(r))
         body.append(
-            "<tr>"
+            f'<tr data-fit="{esc(r.get("fit") or "")}"'
+            f' data-rub="{esc(r.get("ai_rubrics") or "")}"'
+            f' data-arg="{esc(r.get("argus_main") or "")}"'
+            f' data-glm="{model_state(pm.get("glm"))}"'
+            f' data-router="{model_state(pm.get("router"))}"'
+            f' data-star="{model_state(pm.get("starfall"))}"'
+            f' data-lang="{esc(r.get("lang_key") or "")}"'
+            f' data-repo="{esc((r.get("repo_key") or "").replace("github.com/",""))}"'
+            f' data-shape="{esc(r.get("shape") or "")}">' 
             f'<td><span class="name">{esc(r.get("name"))}</span>'
             f'<a class="tid" href="https://horizon.bespokelabs.ai/tasks/{esc(r.get("task_id"))}"'
             f' target="_blank" rel="noopener noreferrer">{esc(r.get("task_id"))}</a>'
@@ -556,7 +584,7 @@ def build(rows: list[dict], generated: str, target: int = 50) -> str:
   the <b>floor</b>, the earliest pick at which a repeat becomes arithmetically unavoidable
   (distinct values + 1). <b>Forced</b> counts repeats where nothing unused was left in the
   pool; <b>traded</b> counts repeats the ordering accepted on purpose, to keep a
-  higher-priority axis fresh. Only a traded repeat reflects a choice.</p>
+  other axes fresh. Only a traded repeat reflects a choice.</p>
   <div class="tablecard"><div class="scroll"><table>
   <thead><tr><th>Axis</th><th class="num">Distinct values</th><th class="num">Floor</th>
   <th class="num">First repeat</th><th class="num">Forced</th><th class="num">Traded</th>
@@ -580,26 +608,21 @@ def build(rows: list[dict], generated: str, target: int = 50) -> str:
 </div>
 <script>
 const rows=[...document.querySelectorAll('#rows tr')];
+// Read the filter values from data-* attributes on the row, NOT from column
+// positions. Positional lookups silently start reading the wrong column the
+// moment anyone inserts one -- which is exactly what happened when three turn
+// columns were added and Language/Repository/Shape began showing turn counts.
 const data=rows.map(tr=>({{tr,
-  fit:tr.children[1].textContent.trim(), rub:tr.children[2].textContent.trim(),
-  arg:tr.children[3].textContent.trim(),
-  glm:tr.children[4].textContent.trim(), router:tr.children[5].textContent.trim(),
-  star:tr.children[6].textContent.trim(),
-  lang:tr.children[11].textContent.trim(), repo:tr.children[12].textContent.trim(),
-  shape:tr.children[13].textContent.trim()}}));
+  fit:tr.dataset.fit||'', rub:tr.dataset.rub||'', arg:tr.dataset.arg||'',
+  glm:tr.dataset.glm||'', router:tr.dataset.router||'', star:tr.dataset.star||'',
+  lang:tr.dataset.lang||'', repo:tr.dataset.repo||'', shape:tr.dataset.shape||''}}));
 const F=id=>document.querySelector(id);
 const sel={{fit:F('#f-fit'),rub:F('#f-rub'),arg:F('#f-arg'),glm:F('#f-glm'),
   router:F('#f-router'),star:F('#f-star'),repo:F('#f-repo'),lang:F('#f-lang'),shape:F('#f-shape')}};
 for(const [key,el] of [['repo',sel.repo],['lang',sel.lang],['shape',sel.shape]])
   [...new Set(data.map(d=>d[key]).filter(v=>v&&v!=='—'))].sort()
     .forEach(v=>{{const o=document.createElement('option');o.textContent=v;el.appendChild(o);}});
-const modelOk=(txt,want)=>{{
-  if(want==='all')return true;
-  if(txt==='—')return want==='none';
-  if(want==='none')return false;
-  const solved=parseInt(txt,10);
-  return want==='fails'?solved<2:solved>=2;
-}};
+const modelOk=(state,want)=>want==='all'||state===want;
 const count=F('#count'), reset=F('#reset');
 function render(){{
   let shown=0;

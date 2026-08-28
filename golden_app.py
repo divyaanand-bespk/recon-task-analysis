@@ -14,7 +14,7 @@ growing, so a stale copy would quietly present an out-of-date golden set.
 The ordering itself is imported from render_report.diverse_order() so that this
 page always presents the shipped policy rather than a private copy of it.  The
 per-pick *explanation* needs the runner-up at each step, which diverse_order()
-does not expose, so the six-term key is re-stated here and then SELF-CHECKED:
+does not expose, so the five-term key is re-stated here and then SELF-CHECKED:
 if replaying it does not reproduce the imported order exactly, the page says so
 and falls back to axis-only rationale.  A silent divergence is not possible.
 """
@@ -31,9 +31,9 @@ HORIZON = "https://horizon.bespokelabs.ai/tasks/"
 AX = (("lang_key", "language"), ("shape", "shape"), ("repo_key", "repository"))
 
 TERMS = [
-    ("Language", "least-used language", "diversity"),
-    ("Shape", "least-used shape", "diversity"),
-    ("Repository", "least-used repository", "diversity"),
+    ("Breadth", "opens the most unused axes at once (3 &gt; 2 &gt; 1 &gt; 0)", "diversity"),
+    ("Pressure", "least relative over-use, each axis judged against its own fair share",
+     "diversity"),
     ("Rollouts", "most eligible rollouts", "quality"),
     ("Turns", "highest median turns", "quality"),
     ("Rank", "existing rank (exact ties only)", "tiebreak"),
@@ -108,11 +108,29 @@ def norm_reason(text: str) -> str:
 
 # ------------------------------------------------------------------ selection
 
-def key_tuple(r, lang_used, shape_used, repo_used):
-    """The shipped six-term lexicographic key, re-stated for explanation only."""
-    return (lang_used[axis(r, "lang_key")],
-            shape_used[axis(r, "shape")],
-            repo_used[axis(r, "repo_key")],
+def key_tuple(r, used, distinct, picks):
+    """The shipped five-term key, re-stated for explanation only.
+
+    The axes are NOT ranked against each other. An earlier version put language
+    first, shape second, repository third, which made language absolutely
+    dominant: a task opening an unused language won even when it repeated both
+    the shape and the repository before it. Given many tasks in ONE repository
+    spread across many languages -- and repositories are multi-language -- that
+    key would cycle languages forever and never leave the repository.
+
+    Term 1 counts how many axes the pick leaves untouched-so-far, so opening
+    three beats opening one regardless of WHICH. Term 2 breaks the remaining
+    ties by summed relative over-use, each axis measured against its own fair
+    share, so the widest axis cannot dominate merely by holding more values.
+    """
+    fresh = 0
+    pressure = 0.0
+    for field, _ in AX:
+        c = used[field][axis(r, field)]
+        if c == 0:
+            fresh += 1
+        pressure += c / max(1.0, picks / max(1, distinct[field]))
+    return (-fresh, pressure,
             -(num(r, "rollouts_n") or 0),
             -(num(r, "turns_median") or 0),
             r.get("_rank", 0))
@@ -129,22 +147,23 @@ def replay(ordered: list[dict]) -> tuple[list[dict], bool]:
     rows = list(ordered)
     for i, r in enumerate(rows):
         r.setdefault("_rank", i)
-    lang_used, shape_used, repo_used = (collections.Counter() for _ in range(3))
+    used = {f: collections.Counter() for f, _ in AX}
+    distinct = {f: len({axis(r, f) for r in rows}) for f, _ in AX}
     picks, faithful = [], True
     remaining = list(rows)
-    for chosen in rows:
-        scored = sorted(remaining, key=lambda r: key_tuple(r, lang_used, shape_used, repo_used))
+    for n, chosen in enumerate(rows):
+        kf = lambda r: key_tuple(r, used, distinct, n)
+        scored = sorted(remaining, key=kf)
         if scored[0] is not chosen:
             faithful = False
-        k = key_tuple(chosen, lang_used, shape_used, repo_used)
+        k = kf(chosen)
         runner = next((r for r in scored if r is not chosen), None)
-        rk = key_tuple(runner, lang_used, shape_used, repo_used) if runner else None
-        decided = next((j for j in range(6) if rk and k[j] != rk[j]), None)
+        rk = kf(runner) if runner else None
+        decided = next((j for j in range(len(TERMS)) if rk and k[j] != rk[j]), None)
         picks.append({"row": chosen, "key": k, "runner": runner, "runner_key": rk,
                       "decided": decided})
-        lang_used[axis(chosen, "lang_key")] += 1
-        shape_used[axis(chosen, "shape")] += 1
-        repo_used[axis(chosen, "repo_key")] += 1
+        for f, _ in AX:
+            used[f][axis(chosen, f)] += 1
         remaining = [r for r in remaining if r is not chosen]
     return picks, faithful
 
@@ -166,8 +185,7 @@ def local_order(rows: list[dict]) -> tuple[list[dict], dict]:
     unknown_n = {f: sum(1 for r in pool if axis(r, f) == "unknown") for f, _ in AX}
     out = []
     while pool:
-        pick = min(pool, key=lambda r: key_tuple(
-            r, used["lang_key"], used["shape"], used["repo_key"]))
+        pick = min(pool, key=lambda r: key_tuple(r, used, distinct, len(out)))
         seq = len(out) + 1
         for field, _ in AX:
             val = axis(pick, field)
@@ -216,7 +234,7 @@ def axis_state(row: dict) -> list[tuple]:
     ``why`` is the strategy module's own verdict: ``fresh`` (this pick opened a
     value nobody had used), ``forced`` (it repeated because no remaining task
     carried an unused value there) or ``traded`` (an unused value existed, but
-    taking it would have spent a higher-priority axis).
+    taking it would have opened less ground overall).
     """
     out = []
     for field, label in AX:
@@ -255,8 +273,8 @@ def rationale(pick: dict, position: int, faithful: bool) -> tuple[str, str]:
     if traded:
         it = "an unused value was" if len(traded) == 1 else "unused values were"
         bits.append(f"It repeats {phrase(traded, True)} by choice — {it} available, but taking "
-                    f"{'it' if len(traded) == 1 else 'them'} would have spent a higher-priority "
-                    f"axis, so the policy paid the cheaper repeat.")
+                    f"{'it' if len(traded) == 1 else 'them'} would have opened fewer axes "
+                    f"overall, so the policy paid the cheaper repeat.")
     if not opened and not forced and not traded:
         bits.append("No axis annotation was recorded for this pick.")
     why = " ".join(bits)
@@ -271,11 +289,13 @@ def rationale(pick: dict, position: int, faithful: bool) -> tuple[str, str]:
     else:
         name = TERMS[j][0]
         a, b = k[j], rk[j]
-        if j < 3:
-            detail = f"{AX[j][1]} used {a}× vs {b}× at this point"
-        elif j == 3:
+        if j == 0:
+            detail = f"opened {-a} fresh {'axis' if -a == 1 else 'axes'} vs {-b}"
+        elif j == 1:
+            detail = f"relative over-use {a:.2f} vs {b:.2f} across the three axes"
+        elif j == 2:
             detail = f"{-a:,} eligible rollouts vs {-b:,}"
-        elif j == 4:
+        elif j == 3:
             detail = f"median {-a:,} turns vs {-b:,}"
         else:
             detail = "identical on every measured term; the earlier row wins"
@@ -453,7 +473,7 @@ def evidence_plot(picks: list[dict]) -> str:
 
 GLYPH = {"fresh": "●", "traded": "◐", "forced": "○"}
 STATE_NOTE = {"fresh": "opened — first use of this value",
-              "traded": "repeated by choice, to protect a higher-priority axis",
+              "traded": "repeated by choice, to open more ground on the other axes",
               "forced": "repeated because the pool held nothing unused here"}
 
 
@@ -881,12 +901,12 @@ def build(data: dict, enrich: dict | None, mod, import_note: str | None) -> str:
     if import_note:
         fidelity = ('<div class="verdict"><h2>Ordering source</h2><p>The shipped '
                     f'<code>diverse_order()</code> could not be imported ({esc(import_note)}), so this '
-                    'page ordered the pool with its own copy of the six-term key. Treat the order as '
+                    'page ordered the pool with its own copy of the five-term key. Treat the order as '
                     'unverified against the strategy module.</p></div>')
     elif not faithful:
         fidelity = ('<div class="verdict"><h2>Order and explanation disagree</h2><p>The order below is '
                     'the one <code>render_report.diverse_order()</code> produced and is authoritative. '
-                    'Replaying the six-term key described here did not reproduce it, which means the '
+                    'Replaying the five-term key described here did not reproduce it, which means the '
                     'shipped key has moved on. The axis rationale still holds; the per-pick '
                     '&ldquo;which term decided it&rdquo; line is suppressed rather than guessed.</p></div>')
 
@@ -922,8 +942,12 @@ def build(data: dict, enrich: dict | None, mod, import_note: str | None) -> str:
                          f'<span class="gl {wy}" aria-hidden="true">{GLYPH.get(wy, "·")}</span>'
                          f'{esc(txt)}</span>')
         k = p["key"]
-        kt = (f'<span class="keyt">key<br><b>{k[0]}</b> <b>{k[1]}</b> <b>{k[2]}</b>'
-              f'<br>{k[3]} {k[4]} {k[5]}</span>')
+        # DIVERSITY TERMS BOLD, QUALITY TERMS PLAIN. Term 1 is stored negated so
+        # that "more fresh axes" sorts first; show it as the count the reader
+        # expects. Pressure is a ratio, so two decimals -- an integer would
+        # collapse most distinctions to 0.
+        kt = (f'<span class="keyt">key<br><b>{-k[0]} fresh</b> <b>{k[1]:.2f}</b>'
+              f'<br>{k[2]} {k[3]} {k[4]}</span>')
         tid = r.get("task_id") or ""
         link = (f'<a href="{HORIZON}{esc(tid)}" target="_blank" rel="noopener noreferrer">'
                 f'{esc(r.get("name") or "unnamed task")}</a>') if tid else esc(r.get("name"))
@@ -1017,7 +1041,7 @@ def build(data: dict, enrich: dict | None, mod, import_note: str | None) -> str:
                       f"{d} distinct values in the pool, the earliest possible repeat is pick "
                       f"{floor}" if at >= floor
                       else f"earlier than the floor of pick {floor}, because keeping it fresh "
-                           "would have cost a higher-priority axis")
+                           "would have opened fewer axes overall")
             ex_lines.append(f'<p><b>{lab}</b> first repeated at <b>pick {at}</b>, {judged}. '
                             f'Across the {n} taken, {forced_c} repeat'
                             f'{"s were" if forced_c != 1 else " was"} forced and {traded_c} '
@@ -1112,20 +1136,26 @@ def build(data: dict, enrich: dict | None, mod, import_note: str | None) -> str:
 
 {sec("At a glance", f'<div class="tiles">{"".join(tiles)}</div>')}
 
-{sec("The key", '''<h2>Six terms, read left to right</h2>
-<p class="sub">A pick wins on the first term where it beats every rival. The three diversity terms
-come first, so a task that opens an unused language outranks a better-measured task that does not.
-The quality terms only ever break ties between equally fresh candidates.</p>'''
+{sec("The key", '''<h2>Five terms, read left to right</h2>
+<p class="sub">A pick wins on the first term where it beats every rival. Crucially the three axes
+&mdash; language, shape, repository &mdash; are <b>not ranked against each other</b>. Term&nbsp;1
+asks only <i>how many</i> of them a pick leaves untouched, so a task opening a new language
+<i>and</i> a new repo <i>and</i> a new shape beats one opening a new language alone. Ranking the
+axes was the old flaw: language came first, so with many tasks in one repository across many
+languages the list would cycle languages forever and never leave that repository. Term&nbsp;2
+settles the rest by relative over-use, each axis judged against its own fair share so the widest
+axis cannot win on cardinality. Quality only ever breaks ties between equally diverse
+candidates.</p>'''
   + f'<ul class="ladder">{"".join(ladder)}</ul>'
   + '<p class="note">Each pick shows its own key as a tuple in the left rail — the three '
-    'diversity counts, then rollouts and turns as negatives (bigger is better, so they sort '
+    'fresh-axis count and pressure, then rollouts and turns as negatives (bigger is better, so they sort '
     'ascending), then the row&rsquo;s original rank. Reading the tuples down the page reproduces '
     'the order.</p>')}
 
 {sec("The picks", f'<h2>{n} task{"s" if n != 1 else ""}, in pick order</h2>'
   + f'<p class="sub">Each links to its Horizon record. The chips say what the pick did to each '
-    'axis: <b>&#9679; opened</b> it, <b>&#9680; repeated it by choice</b> to protect a '
-    'higher-priority axis, or <b>&#9675; repeated it because nothing unused was left</b>.</p>'
+    'axis: <b>&#9679; opened</b> it, <b>&#9680; repeated it by choice</b> to open more '
+    'ground on the other two, or <b>&#9675; repeated it because nothing unused was left</b>.</p>'
   + f'<div class="picks">{"".join(pick_html)}</div>')}
 
 {sec("Reserves", reserve_html) if reserve_html else ""}
