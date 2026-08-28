@@ -321,6 +321,7 @@ already happened once.
 
 | field | what it counts |
 |---|---|
+| `completed_rp` | **the number to lead with.** R/P actions at or before the step the artifact was written -- the work that actually produced the plan. Absent when no write was detected. |
 | `leading_rp` | the UNBROKEN run of research/planning actions from action #1. Stops at the first action that is not one, so a task that researched later reads 0. This is Avi's `leading()` from `phase_profile.py`. |
 | `total_rp` | every research/planning action anywhere in the trajectory |
 | `rp_complete_step` | the ordinal of the last action that WROTE `RESEARCH_AND_PLANNING.md`, or absent if no write was detected |
@@ -328,6 +329,10 @@ already happened once.
 Real example: benthos has `leading_rp` 0 and `total_rp` 206 across 323 actions.
 Its first action was not research; it did plenty afterwards. Reported as a lone
 "R/P: 0" that reads as "did no research", which is the opposite of true.
+
+Median on the 53-task sheet: `completed_rp` 49, `leading_rp` 12. The lead figure
+reads low for most agents and is the reason a reviewer asked why the report
+showed "0 or less than 10".
 
 `fit_for_pilot()` gates on `rp_complete_step` when present and falls back to
 `leading_rp` only when it is absent.

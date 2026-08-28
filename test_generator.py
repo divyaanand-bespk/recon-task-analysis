@@ -142,10 +142,54 @@ class GeneratorTests(unittest.TestCase):
                 {
                     "leading_rp": 2,
                     "total_rp": 2,
+                    "completed_rp": 2,
                     "tool_calls": 3,
                     "rp_complete_step": 2,
                 },
             )
+
+    def test_completed_rp_excludes_research_after_the_plan_was_written(self):
+        """completed_rp counts only what went INTO the plan.
+
+        The three earlier measures all answer a different question and each
+        misreads this trajectory: leading_rp is 0 because action 1 is not
+        research, total_rp is 3 because it counts the research done afterwards,
+        and rp_complete_step is a step index rather than an amount.
+        """
+        def action(ordinal, rp, keystrokes="ls\n"):
+            return {"ordinal": ordinal,
+                    "annotations": {"research_planning": {"research": rp, "planning": False}},
+                    "arguments": {"keystrokes": keystrokes}}
+        write = ("python3 -c \"open('/app/RESEARCH_AND_PLANNING.md','w')"
+                 ".write('x')\"\n")
+        data = {"trajectories": [{"actions": [
+            action(1, False),                 # not research -> leading_rp is 0
+            action(2, True),                  # counts: before the write
+            action(3, True, write),           # counts: it IS the write
+            action(4, True),                  # does NOT count: after the plan
+        ]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "annotated.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            got = GENERATOR.rp_metrics(path)
+        self.assertEqual(got["completed_rp"], 2)
+        self.assertEqual(got["leading_rp"], 0)
+        self.assertEqual(got["total_rp"], 3)
+        self.assertEqual(got["rp_complete_step"], 3)
+
+    def test_completed_rp_is_absent_when_the_artifact_was_never_written(self):
+        data = {"trajectories": [{"actions": [
+            {"ordinal": 1,
+             "annotations": {"research_planning": {"research": True, "planning": False}},
+             "arguments": {"keystrokes": "rg --files\n"}},
+        ]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "annotated.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            got = GENERATOR.rp_metrics(path)
+        self.assertIsNone(got["rp_complete_step"])
+        self.assertIsNone(got["completed_rp"])
+        self.assertEqual(got["total_rp"], 1)
 
     def test_rp_metrics_ignores_false_and_unexecuted_writes(self):
         data = {

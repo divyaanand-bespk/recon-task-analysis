@@ -371,6 +371,7 @@ def load_existing_rows(path: Path) -> list[dict[str, Any]]:
             "incomplete_rollouts": int(incomplete.get(name, 0)),
             "argus_main": argus[name],
             "leading_rp": int(row[9]),
+            "completed_rp": None,
             "rp_complete_step": plan_steps.get(name),
             "total_rp": int(row[10]),
             "tool_calls": int(row[11]),
@@ -1384,11 +1385,28 @@ def rp_metrics(annotated_path: Path) -> dict[str, Any]:
     for action in actions:
         if is_rp_write_action(action):
             completion_steps.append(int(action.get("ordinal", 0)))
+    # COMPLETED R/P: the research and planning that actually went INTO the
+    # artifact -- every R/P-flagged action at or before the step where
+    # RESEARCH_AND_PLANNING.md was last written. Research done afterwards is
+    # real work but it did not inform the plan, so it is excluded.
+    #
+    # This is the number to lead with. `leading_rp` is Avi's leading() run and
+    # stops at the first non-R/P action, so it reads 0 for any agent that did
+    # not open with research; `total_rp` counts research done long after the
+    # plan was filed. Neither answers "how much planning produced this plan".
+    complete_step = max(completion_steps) if completion_steps else None
+    completed_rp = None
+    if complete_step is not None:
+        completed_rp = sum(
+            1 for action, flag in zip(actions, flags)
+            if flag and int(action.get("ordinal", 0)) <= complete_step
+        )
     return {
         "leading_rp": leading,
         "total_rp": sum(flags),
+        "completed_rp": completed_rp,
         "tool_calls": len(actions),
-        "rp_complete_step": max(completion_steps) if completion_steps else None,
+        "rp_complete_step": complete_step,
     }
 
 
@@ -1572,6 +1590,7 @@ def analyse_tasks(
             else {
                 "leading_rp": 0,
                 "total_rp": 0,
+                "completed_rp": None,
                 "tool_calls": 0,
                 "rp_complete_step": None,
             }
@@ -1842,7 +1861,8 @@ SIGNAL_KEYS = {
                 "ai_reviews", "argus_reviews", "ai_count", "argus_main", "shape"),
     "rollouts": ("pass6", "pass6_denominator", "eligible_rollouts", "per_model",
                  "rollout_source", "representative_created_at", "turns_median", "turns_max", "rollouts_n",
-                 "leading_rp", "total_rp", "tool_calls", "rp_complete_step"),
+                 "leading_rp", "total_rp", "completed_rp", "tool_calls",
+                 "rp_complete_step"),
 }
 
 

@@ -192,6 +192,7 @@ def build(data: dict, gated: bool) -> str:
         "owner": r.get("responsible"), "lang": axis(r, "lang_key"),
         "shape": r.get("shape"), "repo": axis(r, "repo_key").replace("github.com/", ""),
         "rollouts": r.get("rollouts_n"), "turns": r.get("turns_median"),
+        "rp_completed": r.get("completed_rp"),
         "rp_lead": r.get("leading_rp"),
         "rp_done": r.get("rp_complete_step"),
         "rp_total": r.get("total_rp"),
@@ -210,9 +211,10 @@ def build(data: dict, gated: bool) -> str:
                 f'<td class="axes">{chips(t)}</td>'
                 f'<td class="n">{esc(t["rollouts"] if t["rollouts"] is not None else DASH)}</td>'
                 f'<td class="n">{esc(t["turns"] if t["turns"] is not None else DASH)}</td>'
+                f'<td class="n">{esc(t["rp_completed"] if t["rp_completed"] is not None else DASH)}</td>'
+                f'<td class="n">{esc(t["rp_done"] if t["rp_done"] is not None else DASH)}</td>'
                 f'<td class="n">{esc(t["rp_total"])}</td>'
                 f'<td class="n">{esc(t["rp_lead"])}</td>'
-                f'<td class="n">{esc(t["rp_done"] if t["rp_done"] is not None else DASH)}</td>'
                 f'<td class="n">{esc(t["pass6"])}</td></tr>')
 
     golden = "".join(row(t) for t in tasks[:TARGET])
@@ -289,15 +291,19 @@ def build(data: dict, gated: bool) -> str:
   <div class="prose"><p>In pick order. Every task links to its Horizon record. The
   <span class="ax new">Lang</span> chips mark an axis this task opened;
   <span class="ax rep">Repo&middot;2</span> means it was the second task on that value.
-  <b>R/P total</b> is all research-and-planning actions; <b>R/P lead</b> counts only the
-  unbroken run at the very start, so a task that researched later shows a low lead and a
-  high total; <b>R/P done</b> is the step the artifact was last written.</p></div>
+  <b>R/P completed</b> is the research and planning that went INTO the plan &mdash; actions at
+  or before the step the artifact was written &mdash; and is the number to read first.
+  <b>R/P done</b> is that step. <b>R/P total</b> counts every research action anywhere, including
+  after the plan was filed. <b>R/P lead</b> is the legacy leading-run measure and stops at the
+  first action that is not research, so it reads low for any agent that did not open with it.
+  A dash means the agent never wrote the artifact.</p></div>
   <div class="scroll tall"><table>
     <thead><tr><th class="n">#</th><th>Task</th><th>Lang</th><th>Shape</th><th>Repository</th>
       <th>Opened</th><th class="n">Rollouts</th><th class="n">Turns</th>
-      <th class="n" title="research and planning actions in total">R/P total</th>
-      <th class="n" title="unbroken run of research/planning actions at the very start">R/P lead</th>
-      <th class="n" title="step at which the research and planning artifact was last written">R/P done</th>
+      <th class="n" title="research and planning actions at or before the step the artifact was written - the work that produced the plan">R/P completed</th>
+      <th class="n" title="step at which RESEARCH_AND_PLANNING.md was last written">R/P done</th>
+      <th class="n" title="every research and planning action anywhere in the trajectory">R/P total</th>
+      <th class="n" title="Avi's leading() - the unbroken run of research/planning actions from the very first action">R/P lead</th>
       <th class="n">pass6</th></tr></thead>
     <tbody>{golden}</tbody>
   </table></div>
@@ -309,9 +315,10 @@ def build(data: dict, gated: bool) -> str:
   <div class="scroll tall"><table>
     <thead><tr><th class="n">#</th><th>Task</th><th>Lang</th><th>Shape</th><th>Repository</th>
       <th>Opened</th><th class="n">Rollouts</th><th class="n">Turns</th>
-      <th class="n" title="research and planning actions in total">R/P total</th>
-      <th class="n" title="unbroken run of research/planning actions at the very start">R/P lead</th>
-      <th class="n" title="step at which the research and planning artifact was last written">R/P done</th>
+      <th class="n" title="research and planning actions at or before the step the artifact was written - the work that produced the plan">R/P completed</th>
+      <th class="n" title="step at which RESEARCH_AND_PLANNING.md was last written">R/P done</th>
+      <th class="n" title="every research and planning action anywhere in the trajectory">R/P total</th>
+      <th class="n" title="Avi's leading() - the unbroken run of research/planning actions from the very first action">R/P lead</th>
       <th class="n">pass6</th></tr></thead>
     <tbody>{trs}</tbody>
   </table></div>
