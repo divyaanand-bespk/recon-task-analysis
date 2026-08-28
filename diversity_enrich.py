@@ -63,7 +63,40 @@ def derive_repo(meta_task_id: str, name: str) -> tuple[str, bool]:
     return "", False
 
 
-def enrich_one(client, task_id: str) -> dict:
+DEFAULT_CACHE = os.path.join(
+    os.path.expanduser("~"), ".cache", "pilot-analysis", "enrich")
+
+
+def cache_path(cache_dir: str, task_id: str, version) -> str:
+    return os.path.join(cache_dir, f"{task_id}-v{version}.json")
+
+
+def digest_files(files: dict, workers: int) -> dict:
+    """sha256 of every shipped file, or None where the fetch failed.
+
+    A task ships ~86 files and each fetch is a ~0.14 s round trip, so fetching
+    them one at a time was 12 of the 17 seconds this function spent per task.
+    Only the FETCH is concurrent: the caller still assembles the fingerprint in
+    sorted(files) order, because a fingerprint that varied with thread
+    scheduling would make every re-run look like a new task.
+    """
+    paths = sorted(files)
+    if not paths:
+        return {}
+
+    def one(path: str):
+        try:
+            data = urllib.request.urlopen(files[path], timeout=180).read()
+            return path, hashlib.sha256(data).hexdigest()
+        except Exception:
+            return path, None
+
+    with cf.ThreadPoolExecutor(max(1, min(workers, len(paths)))) as ex:
+        return dict(ex.map(one, paths))
+
+
+def enrich_one(client, task_id: str, cache_dir: str | None = None,
+               file_workers: int = 8) -> dict:
     row = {"task_id": task_id, "problems": []}
     try:
         task = client.tasks.get(task_id)
@@ -72,6 +105,17 @@ def enrich_one(client, task_id: str) -> dict:
     except Exception as exc:
         row["problems"].append(f"tasks.get: {type(exc).__name__}")
         return row
+    # Everything below is a pure function of the task AT THIS VERSION, so the
+    # cache is keyed on the version and a new version misses it by construction.
+    cached = cache_path(cache_dir, task_id, row["version"]) if cache_dir else None
+    if cached and os.path.isfile(cached):
+        try:
+            with open(cached) as fh:
+                hit = json.load(fh)
+            if hit.get("task_id") == task_id and hit.get("version") == row["version"]:
+                return hit
+        except Exception:
+            pass
     try:
         files = {f.path: f.url for f in client.tasks.download_urls(task_id).files}
     except Exception as exc:
@@ -132,21 +176,33 @@ def enrich_one(client, task_id: str) -> dict:
     row["base_commit"] = meta.get("base_commit_hash", "")
 
     # content fingerprint -> exact-duplicate detection across differently named rows
-    parts, unread = [], 0
     archive_sha = meta.get("faulted_archive_sha256", "")
+    fetchable = {p: u for p, u in files.items()
+                 if not (p.endswith(BIG) and archive_sha)}
+    digests = digest_files(fetchable, file_workers)
+    parts, unread = [], 0
     for p in sorted(files):
         if p.endswith(BIG) and archive_sha:
             parts.append(f"{p}\0{archive_sha}")
             continue
-        try:
-            data = urllib.request.urlopen(files[p], timeout=180).read()
-            parts.append(f"{p}\0{hashlib.sha256(data).hexdigest()}")
-        except Exception:
+        digest = digests.get(p)
+        if digest is None:
             unread += 1
+            continue
+        parts.append(f"{p}\0{digest}")
     if unread:
         row["problems"].append(f"{unread} file(s) unreadable; fingerprint PARTIAL")
     row["fingerprint_partial"] = bool(unread)
     row["fingerprint"] = hashlib.sha256("\n".join(parts).encode()).hexdigest() if parts else ""
+    if cached:
+        try:
+            os.makedirs(os.path.dirname(cached), exist_ok=True)
+            tmp = cached + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(row, fh)
+            os.replace(tmp, cached)
+        except Exception:
+            pass
     return row
 
 
@@ -155,7 +211,14 @@ def main() -> int:
     ap.add_argument("--task-file")
     ap.add_argument("--task-ids", default="")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--file-workers", type=int, default=8,
+                    help="Concurrent file fetches WITHIN one task. The per-file"
+                         " round trip, not the bytes, is what this stage spends.")
+    ap.add_argument("--cache", default=DEFAULT_CACHE,
+                    help="Directory of per-(task, version) results. A re-run"
+                         " after adding tasks pays only for the new ones.")
+    ap.add_argument("--no-cache", action="store_true")
     args = ap.parse_args()
 
     ids: list[str] = []
@@ -172,9 +235,11 @@ def main() -> int:
 
     from horizon.client import HorizonClient
     client = HorizonClient(api_key=os.environ["HORIZON_API_KEY"])
+    cache_dir = None if args.no_cache else args.cache
     print(f"enriching {len(ids)} tasks ...", file=sys.stderr)
     with cf.ThreadPoolExecutor(args.workers) as ex:
-        rows = list(ex.map(lambda t: enrich_one(client, t), ids))
+        rows = list(ex.map(
+            lambda t: enrich_one(client, t, cache_dir, args.file_workers), ids))
     json.dump({"tasks": rows}, open(args.out, "w"), indent=2)
     bad = sum(1 for r in rows if r["problems"])
     print(f"wrote {len(rows)} rows -> {args.out}   ({bad} with problems)", file=sys.stderr)
