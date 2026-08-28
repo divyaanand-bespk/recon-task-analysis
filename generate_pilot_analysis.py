@@ -382,6 +382,12 @@ class HorizonDatabase:
         self._local = threading.local()
         self._connections: list[Any] = []
         self._connection_lock = threading.Lock()
+        self._pool: cf.ThreadPoolExecutor | None = None
+        self._pool_size = 0
+        # A connection costs ~560 ms and the local proxy handles a burst of them
+        # badly: twelve at once measured 16.5 s against 2.0 s once warm. Queries
+        # stay fully concurrent; only the handshakes queue.
+        self._connect_slots = threading.Semaphore(4)
         # PILOT_NO_PSYCOPG=1 forces the original psql path, which is the
         # comparison used to prove the two routes agree.
         self._use_psycopg = (
@@ -417,6 +423,10 @@ class HorizonDatabase:
         return self
 
     def __exit__(self, *_: object) -> None:
+        with self._connection_lock:
+            pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=True)
         with self._connection_lock:
             connections, self._connections = self._connections, []
         for connection in connections:
@@ -498,6 +508,14 @@ class HorizonDatabase:
         connection = getattr(self._local, "connection", None)
         if connection is not None and not connection.closed:
             return connection
+        with self._connect_slots:
+            connection = self._open_connection()
+        self._local.connection = connection
+        with self._connection_lock:
+            self._connections.append(connection)
+        return connection
+
+    def _open_connection(self) -> Any:
         connection = _psycopg.connect(
             host="127.0.0.1",
             port=self.port,
@@ -512,10 +530,25 @@ class HorizonDatabase:
         )
         # The role is already SELECT-only; this is the second lock on the door.
         connection.read_only = True
-        self._local.connection = connection
-        with self._connection_lock:
-            self._connections.append(connection)
         return connection
+
+    def pool(self, jobs: int) -> cf.ThreadPoolExecutor:
+        """One pool for the whole run, so threads -- and their connections --
+        are reused across stages.
+
+        A fresh ThreadPoolExecutor per stage meant fresh threads, and a
+        thread-local connection means a fresh CONNECTION per stage: metadata,
+        message counts and export each paid for twelve of them. Reusing the pool
+        pays once.
+        """
+        with self._connection_lock:
+            if self._pool is None or jobs > self._pool_size:
+                if self._pool is not None:
+                    self._pool.shutdown(wait=True)
+                self._pool_size = max(jobs, self._pool_size)
+                self._pool = cf.ThreadPoolExecutor(
+                    self._pool_size, thread_name_prefix="horizon")
+            return self._pool
 
     def _csv_psycopg(self, copy_sql: str) -> str:
         connection = self._connection()
@@ -705,21 +738,33 @@ def load_task_metadata(db: HorizonDatabase, task_ids: list[str],
     # sheet's density, it returns 45,219 rows in 48 s, and its cost per task
     # FALLS as the list grows because the plan is index-driven throughout
     # (idx_rubric_ai_reviews_task_id, and the findings subquery is memoized at
-    # 0.003 ms a row). Chunking is here so the question never has to be asked
-    # again at 300 or 3000 tasks, and it wins back the wall-clock as a bonus.
+    # 0.003 ms a row).
+    #
+    # So this uses a FIXED cap rather than balanced_chunks(): below the cap the
+    # whole sheet is one chunk that runs inline on the caller's warm connection,
+    # and above it the work splits and goes parallel. Splitting a 156-task sheet
+    # across twelve workers measured SLOWER -- 2.6 s against 1.9 s -- because
+    # twelve connections cost more than the query saves. Concurrency here is
+    # insurance against the timeout, not a speed-up, so it should not be bought
+    # until it is needed.
     #
     # Chunking is only sound because DISTINCT ON dedupes WITHIN a task: no task
     # spans two chunks, so each chunk resolves its own tasks completely and the
     # rows for one task keep their relative order.
-    chunks = balanced_chunks(task_ids, jobs, TASK_METADATA_CHUNK)
+    chunks = chunked(task_ids, TASK_METADATA_CHUNK)
 
     def fetch_names(chunk: list[str]) -> list[dict[str, str]]:
         return db.csv(
-            f"SELECT id::text AS task_id, name FROM task WHERE id IN ({sql_ids(chunk)})"
+            f"""SELECT t.id::text AS task_id, t.name,
+                       COALESCE(b.name, '') AS batch_name
+                FROM task t LEFT JOIN batches b ON b.id = t.batch_id
+                WHERE t.id IN ({sql_ids(chunk)})"""
         )
 
-    tasks = [row for rows in map_chunks(fetch_names, chunks, jobs) for row in rows]
-    found = {row["task_id"]: {"name": row["name"]} for row in tasks}
+    tasks = [row for rows in map_chunks(db, fetch_names, chunks, jobs) for row in rows]
+    found = {row["task_id"]: {"name": row["name"],
+                             "batch_name": row.get("batch_name", "")}
+             for row in tasks}
     missing = [task_id for task_id in task_ids if task_id not in found]
     if missing:
         raise SystemExit(f"Task IDs not found in Horizon: {', '.join(missing)}")
@@ -746,7 +791,7 @@ def load_task_metadata(db: HorizonDatabase, task_ids: list[str],
             """
         )
 
-    reviews = [row for rows in map_chunks(fetch_reviews, chunks, jobs) for row in rows]
+    reviews = [row for rows in map_chunks(db, fetch_reviews, chunks, jobs) for row in rows]
     grouped: dict[str, list[dict[str, Any]]] = {task_id: [] for task_id in task_ids}
     for row in reviews:
         record = json.loads(row["review_json"])
@@ -790,7 +835,9 @@ def load_task_metadata(db: HorizonDatabase, task_ids: list[str],
                               for r in pass_reviews) else "Fail")
         item["grader_coverage"] = next(
             (r.get("result") for r in grader_coverage_reviews), None)
-        item["shape"] = shape_from_reviews(len(ai_reviews), ai_names)
+        item["shape"] = (shape_from_batch(item["batch_name"])
+                         if item.get("batch_name")
+                         else shape_from_reviews(len(ai_reviews), ai_names))
         argus = next(
             (
                 review
@@ -846,19 +893,20 @@ def balanced_chunks(values: list[Any], jobs: int, cap: int) -> list[list[Any]]:
     return chunked(values, min(cap, size))
 
 
-def map_chunks(work: Any, chunks: list[Any], jobs: int) -> list[Any]:
-    """Run chunks in a pool, but stay on this thread for a single chunk.
+def map_chunks(db: "HorizonDatabase", work: Any, chunks: list[Any],
+               jobs: int) -> list[Any]:
+    """Run chunks on the run's shared pool, or inline for a single chunk.
 
     Each worker thread opens its own database connection, and a connection
-    costs ~560 ms. Handing one chunk to a fresh thread throws away the caller's
-    already-warm connection to pay for a new one.
+    costs ~560 ms. Handing one chunk to another thread throws away the caller's
+    already-warm connection to pay for a new one, and a pool created per stage
+    would pay for a whole new set at every stage.
     """
     if not chunks:
         return []
     if len(chunks) == 1 or jobs <= 1:
         return [work(chunk) for chunk in chunks]
-    with cf.ThreadPoolExecutor(min(jobs, len(chunks))) as pool:
-        return list(pool.map(work, chunks))
+    return list(db.pool(min(jobs, len(chunks))).map(work, chunks))
 
 
 def rollout_message_counts(
@@ -900,7 +948,7 @@ def rollout_message_counts(
             """
         )
 
-    results = map_chunks(one, chunks, jobs)
+    results = map_chunks(db, one, chunks, jobs)
     counts: dict[str, tuple[int, int]] = {}
     for rows in results:
         for row in rows:
@@ -1081,7 +1129,7 @@ def export_message_batches(
             for task_dir in targets[rollout_id]:
                 write_trajectory(rollout_id, rollout_rows, task_dir)
 
-    map_chunks(one, chunks, jobs)
+    map_chunks(db, one, chunks, jobs)
 
 
 def prepare_worker_key() -> tuple[Path, bool]:
