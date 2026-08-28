@@ -1838,10 +1838,27 @@ def collapse_variants(rows: list[dict[str, Any]],
         #     If no variant's latest run passes, the most recent failing run is
         #     what gets reported.
         def latest_per_name(reviews):
+            """The latest run of each rubric THAT PRODUCED A VERDICT.
+
+            A run with status != 'completed' errored: it carries an empty
+            `result` and says nothing about the task. Taking it as "the latest
+            run" turned an infrastructure failure into a rubric failure --
+            ai_review_passes() requires status == 'completed', so the empty row
+            read as a Fail and buried the PASS underneath it. Measured on the
+            99-id sheet: 163 errored runs, ALL with an empty result, masking a
+            genuine earlier PASS on 2 task ids (one of them 4 rubrics deep).
+
+            An errored run is an absence of an answer, not a negative one, so it
+            is skipped and the newest completed run stands. If a rubric has only
+            errored runs it has no verdict at all and is absent from the map,
+            which is the honest reading.
+            """
             out: dict[str, dict[str, Any]] = {}
             for review in reviews or []:
                 name = review.get("rubric_name")
                 if not name:
+                    continue
+                if str(review.get("status", "")).lower() != "completed":
                     continue
                 held = out.get(name)
                 if held is None or str(review.get("created_at") or "") > str(
