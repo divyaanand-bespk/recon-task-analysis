@@ -16,7 +16,11 @@ Three further scripts sit around it. `diversity_enrich.py` attaches the reposito
   export PATH="/opt/homebrew/opt/libpq/bin:$PATH"
   ```
 
-  The scripts shell out to `psql` and parse `COPY ... TO STDOUT`. They do not import a Python database driver, so `psycopg` is not needed.
+  The scripts run `COPY ... TO STDOUT` and parse the CSV. `psycopg` is used when it is
+  importable, because a persistent connection removes a process spawn and a TLS handshake
+  per query, but it is optional: without it every query falls back to `psql`, which is why
+  `psql` is still required. Both routes send the identical statement and are verified to
+  return identical rows. Set `PILOT_NO_PSYCOPG=1` to force the `psql` path.
 - Keep the transcript analysis pipeline at `~/voyager-alpharecon-rp` and the annotation tool at `~/tool-call-clustering`. A symlink is enough:
 
   ```bash
@@ -48,13 +52,16 @@ It connects as `grafana_ro` and reads the password from the `grafana-postgres-ro
 
 This route needs no IAP roles, only permission to read the role's password from Secret Manager, and WARP for the private IP. Start the proxy in its own shell:
 
+Authenticate once with application default credentials, then start the proxy with no token at all:
+
 ```bash
-cloud-sql-proxy --private-ip --port 15433 \
-  --token "$(gcloud auth print-access-token)" \
-  apex-485220:us-central1:horizon-db
+gcloud auth application-default login
+cloud-sql-proxy --private-ip --port 15433 apex-485220:us-central1:horizon-db
 ```
 
-Never paste a literal token into a script or a shell history. Use the command substitution above, or run `gcloud auth application-default login` and drop `--token` entirely. A token passed on the command line is visible to every process on the machine through `ps`.
+**Prefer this form.** The `--token "$(gcloud auth print-access-token)"` variant works, but the token expires after about an hour and the proxy does not exit when it does. Every subsequent connection fails with `server closed the connection unexpectedly` while the process is still running and still listening, which reads exactly like a database outage. It cost two runs before it was recognised. ADC refreshes itself and does not have this failure mode.
+
+If you do use `--token`, never paste a literal token into a script or a shell history: pass it as the command substitution above, because a token on the command line is readable by every process on the machine through `ps`.
 
 Then point the script at that proxy and at the role it serves:
 
@@ -73,6 +80,7 @@ Enrichment first, because the analysis reads its output. Rendering last, and rep
 ```bash
 # 1. Repository, language and content fingerprint per task, from the API.
 export HORIZON_API_KEY=...
+# Cached per (task, version) under ~/.cache/pilot-analysis/enrich, so re-runs are near-free.
 python3 diversity_enrich.py --task-file new-task-ids.txt --out ~/Downloads/enrich.json
 
 # 2. The measurement pass. Talks to the database, exports trajectories, labels R/P.
@@ -93,9 +101,14 @@ python3 select_pilot.py \
   --enrich ~/Downloads/enrich.json \
   --target 50 --max-per-repo 3 --max-lang-share 0.5 \
   --out ~/Downloads/pilot-50.html
+
+# 5. Optional: render the golden set and why each task was picked at its position.
+python3 golden_app.py ~/Downloads/pilot-report.json \
+  --enrich ~/Downloads/enrich.json \
+  -o ~/Downloads/golden-set.html
 ```
 
-Step 2 writes a JSON sidecar beside the HTML. Steps 3 and 4 consume that sidecar, so both are cheap to re-run while only step 2 costs money and time.
+Step 2 writes a JSON sidecar beside the HTML. Steps 3, 4 and 5 consume that sidecar, so all three are cheap to re-run while only step 2 costs money and time.
 
 ## Run for one task
 
@@ -156,12 +169,51 @@ Rubrics and rollouts resolve independently, because a task routinely carries its
 
 Diversity is a property of the pool, not of a task, so it is not part of `fit_for_pilot`. Two individually perfect tasks can still be a bad pair. Eligibility is decided per task, then `select_pilot.py` applies the caps while walking the eligible list: no repository above `--max-per-repo`, no language above `--max-lang-share` of the selection, and identical content fingerprints collapsed. A shortfall is reported rather than traded away. If N cannot be reached without breaching a cap, the selection stops short and says so.
 
+## Caches
+
+Two caches make a re-run cheap. Both are on by default and both are keyed so that a stale entry cannot be served for changed content.
+
+| Cache | Location | Key | Off with |
+| --- | --- | --- | --- |
+| R/P labels | `~/.cache/pilot-analysis/rp` | rollout ID | `--no-rp-cache` |
+| Enrichment | `~/.cache/pilot-analysis/enrich` | task ID and version | `--no-cache` |
+
+R/P labelling is the only step that costs money, so its cache is the one that matters: adding 5 tasks to a 156-task sheet pays for 5 tasks of labelling, not 156. Point `--rp-cache` elsewhere to use a different directory, and `--seed-rp-cache` adopts annotations already sitting in `runs/` so work done before the cache existed is not paid for twice.
+
+The enrichment cache is keyed on task **and version**, so a task edited on Horizon re-fetches while everything else is served locally. `--file-workers` sets the per-task fetch concurrency and `--workers` the task concurrency; `--workers` now defaults to 16.
+
+## Performance notes
+
+Both matter if you touch the data path.
+
+- **Do not join `messages` inside the rollout query.** That table is 156 million rows and 176 GB, the read-only role has `statement_timeout=120s`, and past roughly 40 tasks the planner abandons the rollout index. The result was not a slow run but a failed one: 20 tasks took 2.8 s and 40, 60, 100 and 156 tasks all timed out. Fetching the rollout IDs first and then counting messages by ID in parallel chunks, against `idx_messages_rollout_id_role`, does 156 tasks in 0.9-1.8 s.
+- **`psycopg` is used when importable**, holding one connection per thread, autocommit and read-only, which drops the fixed per-query cost from 652 ms to 82 ms. It falls back to `psql` automatically, and `PILOT_NO_PSYCOPG=1` forces the fallback. Retries are bounded and only on connection failures, so a genuine query error still surfaces immediately.
+
+## Callers of `diverse_order()`
+
+`render_report.diverse_order()` now returns `(ordered, diagnostics)` rather than a bare list. **This is a breaking change.** Anything with its own caller must unpack the tuple. `golden_app.py` imports it and handles both shapes, degrading to less detail rather than crashing if the signature moves again.
+
+The diagnostics distinguish a **forced** pick, where no alternative existed on that axis, from a **traded** one, where diversity was genuinely spent, and report per axis the distinct values, the floor, the first repeat, and whether the result was optimal or degenerate. A target that cannot be filled is reported as a shortfall rather than padded.
+
 ## Known gotchas
 
 - **The sheet's columns move.** They have been re-ordered once already. That is why the CSV parser matches on header text; a positional parser silently read numbers as owner names and every task ID as absent.
-- **`load_rollouts` hits the statement timeout at roughly 78 tasks.** Split a larger sheet into batches and merge the reports with `--base-html`.
+- **`load_rollouts` used to hit the statement timeout.** It joined `messages` -- 156 million
+  rows, 176 GB -- inside the rollout query, and the planner stopped using the rollout index
+  somewhere around 40 tasks, so the run FAILED rather than slowed. It now asks for the
+  rollout ids first and counts messages by those ids, which is 1.8 s at 156 tasks. Do not
+  put that join back.
+- **The COPY stream must be parsed with the line terminators intact.** `csv.DictReader(stdout.splitlines())` threw them away, so a `\r\n` inside a quoted message body silently became `\n`. It hit 20 of 20 rollouts and lost 80,508 of 4,498,714 characters, about 1.79%, while row counts and the rendered output stayed correct -- nothing failed, the trajectories were just slightly short, and that content is what the R/P labeller reads. Every trajectory exported before the fix is affected. The parse now goes through `io.StringIO(text, newline="")` and a regression test guards it.
 - **`rollouts.local_task_id` is not always a UUID.** 122 rows hold non-UUID values, and casting them aborts the whole query. The query guards with a regex before the `::uuid` cast; do not remove it.
-- **R/P labelling costs money.** Roughly $3.40 per 11 tasks, billed to whichever Horizon key the caller supplies. Re-run steps 3 and 4 rather than step 2 when you only need a different view of the same measurements.
+- **R/P labelling costs money.** Roughly $3.40 per 11 tasks, billed to whichever Horizon key
+  the caller supplies. Labels are cached per rollout id under `~/.cache/pilot-analysis/rp`,
+  so a re-run pays only for rollouts it has not labelled before; `--no-rp-cache` forces a
+  relabel and `--seed-rp-cache` adopts annotations left in `runs/`. Re-run steps 3 and 4
+  rather than step 2 when you only need a different view of the same measurements.
+- **The `cloud-sql-proxy --token` route expires after about an hour.** Every connection then
+  fails with "server closed the connection unexpectedly" while the proxy process stays
+  alive, so it looks like a database outage. Restart the proxy, or run
+  `gcloud auth application-default login` once and drop `--token`.
 - **`psql` is keg-only on macOS.** The script fails on a missing `psql` even though libpq is installed. Export the path shown above.
 - **The proxy port is not the tunnel port.** The IAP tunnel defaults to 15434 and the proxy example above uses 15433. Pass `--port` to match whichever you started.
 
