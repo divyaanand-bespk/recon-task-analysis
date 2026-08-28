@@ -9,6 +9,8 @@ representative rollout per task.
 from __future__ import annotations
 
 import argparse
+import collections
+import concurrent.futures as cf
 import csv
 import html
 from html.parser import HTMLParser
@@ -30,7 +32,22 @@ DEFAULT_BASE_HTML = Path(__file__).resolve().with_name("pilot-task-analysis-base
 DEFAULT_PIPELINE_ROOT = Path.home() / "voyager-alpharecon-rp"
 DEFAULT_TOOL_ROOT = Path.home() / "tool-call-clustering"
 DEFAULT_PORT = 15434
-MODEL_FILTER_SQL = "(e.model LIKE 'starfall%' OR e.model LIKE 'router-16a8dce2a6e7%')"
+# Two read-only routes reach the same instance. The IAP tunnel needs
+# iap.tunnelResourceAccessor + compute.viewer; the cloud-sql-proxy route over
+# WARP needs only secretmanager access to the role's password. Setting
+# HORIZON_DB_ROLE (and HORIZON_DB_PASSWORD, or HORIZON_DB_SECRET) lets an
+# already-running proxy be reused, and is_ready() then skips opening a tunnel.
+DB_ROLE = os.environ.get("HORIZON_DB_ROLE", "grafana_ro")
+DB_SECRET = os.environ.get("HORIZON_DB_SECRET", "grafana-postgres-ro-password")
+MODEL_FILTER_SQL = (
+    "(e.model LIKE 'starfall%' OR e.model LIKE 'router-16a8dce2a6e7%'"
+    " OR e.model LIKE 'cipher-omni%')"
+)
+# Pass@6 is reported PER MODEL as well as pooled: a pass rate is a property of
+# (artifact x model), and this batch was measured on three of them. Pooling them
+# hides that a task solved 3/6 by one model was solved 0/6 by another.
+MODEL_COLUMNS = [("glm", "cipher-omni"), ("router", "router-16a8dce2a6e7"),
+                 ("starfall", "starfall")]
 GLOBAL_REVIEW_NAMES = {
     "grader coverage",
     "argus lite",
@@ -49,6 +66,22 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         help="Horizon task UUIDs or full Horizon task URLs.",
     )
+    parser.add_argument(
+        "--task-csv",
+        type=Path,
+        help=(
+            "CSV where each row is ONE logical task shipped as up to three Horizon "
+            "tasks: final, binary, partial. Every variant is analysed, then each "
+            "signal trickles down to the first variant that carries it."
+        ),
+    )
+    parser.add_argument(
+        "--enrich",
+        type=Path,
+        help="diversity_enrich.py output, adding repository and language per task.",
+    )
+    parser.add_argument("--max-per-repo", type=int, default=3)
+    parser.add_argument("--max-lang-share", type=float, default=0.5)
     parser.add_argument(
         "--task-file",
         type=Path,
@@ -90,6 +123,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TOOL_ROOT,
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--jobs", type=int, default=12,
+        help="Parallel workers for per-task export/prepare/merge. Each step shells"
+             " out once per task, so these loops dominate wall-clock as the sheet grows.")
+    parser.add_argument(
+        "--label-concurrency", type=int, default=16,
+        help="Concurrent chunks for the R/P labelling pass.")
     parser.add_argument(
         "--keep-run-files",
         action="store_true",
@@ -135,8 +175,84 @@ def normalize_task_id(value: str) -> str:
     return str(uuid.UUID(value))
 
 
+VARIANT_ORDER = ("final", "binary", "partial")
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I
+)
+
+
+def read_variant_csv(path: Path) -> list[dict[str, Any]]:
+    """One row per logical task, with its variant task ids.
+
+    Columns are located BY HEADER TEXT, not position. The sheet has already been
+    re-ordered once -- "Responsible" moved from column 2 to column 0 and the
+    separate "ready to go" column merged into "Binary Version" -- and positional
+    parsing does not fail loudly when that happens: it silently reads version
+    numbers as owner names and every task id as absent. Matching on header text
+    survives re-ordering and added columns.
+
+    A sheet may carry two variants (binary, partial) or three (final as well);
+    whichever are present are returned, and the trickle walks them in order.
+    """
+    import csv as _csv
+
+    rows = list(_csv.reader(path.read_text(encoding="utf-8").splitlines()))
+    if not rows:
+        return []
+    header = [h.strip().casefold() for h in rows[0]]
+
+    def find(*needles: str, exclude: tuple[str, ...] = ()) -> int | None:
+        for i, cell in enumerate(header):
+            if any(n in cell for n in needles) and not any(x in cell for x in exclude):
+                return i
+        return None
+
+    # "binary" also carries the ready-to-go task in the current sheet, so a
+    # sheet without a separate final column simply has no final variant.
+    idx = {
+        "final": find("ready to go", exclude=("binary",)),
+        "binary": find("binary"),
+        "partial": find("partial"),
+    }
+    who = find("responsible")
+    reviewer = find("reviewer")
+    status = find("status")
+    if not any(v is not None for v in idx.values()):
+        raise SystemExit(
+            f"No task-id columns found in {path.name}. Header was: {rows[0]}")
+
+    groups: list[dict[str, Any]] = []
+    for row in rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+
+        def grab(i: int | None) -> str | None:
+            if i is None or i >= len(row):
+                return None
+            found = _UUID_RE.findall(row[i])
+            return str(uuid.UUID(found[0])) if found else None
+
+        def text(i: int | None) -> str:
+            return row[i].strip() if i is not None and i < len(row) else ""
+
+        group = {name: grab(i) for name, i in idx.items()}
+        if not any(group.values()):
+            continue
+        group["responsible"] = text(who)
+        group["reviewer"] = text(reviewer)
+        group["sheet_status"] = text(status)
+        groups.append(group)
+    return groups
+
+
 def collect_task_ids(args: argparse.Namespace) -> list[str]:
     values = list(args.task_ids)
+    if getattr(args, "task_csv", None):
+        args.variant_groups = read_variant_csv(args.task_csv)
+        for group in args.variant_groups:
+            values.extend(
+                group[key] for key in VARIANT_ORDER if group.get(key)
+            )
     if args.task_file:
         values.extend(
             line.strip()
@@ -244,7 +360,7 @@ class HorizonDatabase:
                         "versions",
                         "access",
                         "latest",
-                        "--secret=grafana-postgres-ro-password",
+                        f"--secret={DB_SECRET}",
                         "--project=apex-485220",
                     ]
                 ).stdout.strip()
@@ -280,7 +396,7 @@ class HorizonDatabase:
                 "-p",
                 str(self.port),
                 "-U",
-                "grafana_ro",
+                DB_ROLE,
                 "-d",
                 "horizon",
                 "-tAc",
@@ -338,7 +454,7 @@ class HorizonDatabase:
                 "-p",
                 str(self.port),
                 "-U",
-                "grafana_ro",
+                DB_ROLE,
                 "-d",
                 "horizon",
                 "-c",
@@ -425,9 +541,11 @@ def is_global_review(name: str) -> bool:
     return base_name in GLOBAL_REVIEW_NAMES
 
 
-def ai_review_passes(review: dict[str, Any]) -> bool:
+def ai_review_passes(review: dict[str, Any],
+                    ignore_grader_coverage: bool = True) -> bool:
     name = str(review.get("rubric_name", ""))
-    if re.sub(r"^\[[^]]+\]\s*", "", name).strip().casefold() == "grader coverage":
+    if (ignore_grader_coverage
+            and re.sub(r"^\[[^]]+\]\s*", "", name).strip().casefold() == "grader coverage"):
         return True
     return (
         str(review.get("status", "")).lower() == "completed"
@@ -461,7 +579,7 @@ def load_task_metadata(db: HorizonDatabase, task_ids: list[str]) -> dict[str, di
         FROM rubric_ai_reviews ar
         JOIN rubrics r ON r.id = ar.rubric_id
         WHERE ar.task_id IN ({ids})
-        ORDER BY ar.task_id, ar.rubric_id, ar.created_at DESC
+        ORDER BY ar.task_id, ar.rubric_id, ar.task_version DESC, ar.created_at DESC
         """
     )
     grouped: dict[str, list[dict[str, Any]]] = {task_id: [] for task_id in task_ids}
@@ -490,12 +608,23 @@ def load_task_metadata(db: HorizonDatabase, task_ids: list[str]) -> dict[str, di
             == "grader coverage"
         ]
         pass_reviews = ai_reviews + grader_coverage_reviews
+        # Retain the reviews themselves: the variant collapse needs to inherit a
+        # pass per rubric across variants, which a count cannot express.
+        item["ai_reviews"] = pass_reviews
         item["ai_count"] = len(ai_reviews)
-        item["ai_rubrics"] = (
-            "Pass"
-            if pass_reviews and all(ai_review_passes(review) for review in pass_reviews)
-            else "Fail"
-        )
+        # "None" is not "Fail": a task with no applicable reviews has not been
+        # judged, and collapsing the two makes an unreviewed task look rejected.
+        if not pass_reviews:
+            item["ai_rubrics"] = "None"
+            item["ai_rubrics_strict"] = "None"
+        else:
+            item["ai_rubrics"] = (
+                "Pass" if all(ai_review_passes(r) for r in pass_reviews) else "Fail")
+            item["ai_rubrics_strict"] = (
+                "Pass" if all(ai_review_passes(r, ignore_grader_coverage=False)
+                              for r in pass_reviews) else "Fail")
+        item["grader_coverage"] = next(
+            (r.get("result") for r in grader_coverage_reviews), None)
         item["shape"] = shape_from_reviews(len(ai_reviews), ai_names)
         argus = next(
             (
@@ -505,6 +634,8 @@ def load_task_metadata(db: HorizonDatabase, task_ids: list[str]) -> dict[str, di
             ),
             None,
         )
+        item["argus_reviews"] = [
+            r for r in all_reviews if r["rubric_name"] == "Environment & Grading Lint"]
         item["argus_main"] = classify_argus(argus)
     return found
 
@@ -538,7 +669,8 @@ def load_rollouts(db: HorizonDatabase, task_ids: list[str]) -> dict[str, dict[st
         FROM rollouts r
         JOIN evaluations e ON e.id = r.evaluation_id
         LEFT JOIN messages m ON m.rollout_id = r.id
-        WHERE r.local_task_id::uuid IN ({ids}) AND {MODEL_FILTER_SQL}
+        WHERE r.local_task_id ~ '^[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}$'
+          AND r.local_task_id::uuid IN ({ids}) AND {MODEL_FILTER_SQL}
         GROUP BY r.local_task_id, r.id, e.model, e.status,
                  r.extracted_score, r.created_at
         """
@@ -575,7 +707,27 @@ def load_rollouts(db: HorizonDatabase, task_ids: list[str]) -> dict[str, dict[st
         else:
             representative = None
             rollout_source = "Unavailable"
+        per_model: dict[str, Any] = {}
+        for label, prefix in MODEL_COLUMNS:
+            subset = [row for row in completed if (row["model"] or "").startswith(prefix)]
+            subset.sort(key=lambda row: (row["created_at"], row["rollout_id"]), reverse=True)
+            six = subset[:6]
+            per_model[label] = {
+                "pass6": sum(numeric_score_is_one(row["extracted_score"]) for row in six),
+                "denominator": len(six),
+                "median_turns": (
+                    sorted(row["assistant_turns"] for row in six)[len(six) // 2]
+                    if six else None
+                ),
+            }
+        # Turn depth over the same six rollouts pass@6 is computed from, so the
+        # numbers in a row always describe one set of runs.
+        six_turns = sorted(r["assistant_turns"] for r in latest)
         result[task_id] = {
+            "turns_median": six_turns[len(six_turns) // 2] if six_turns else None,
+            "turns_max": six_turns[-1] if six_turns else None,
+            "rollouts_n": len(completed),
+            "per_model": per_model,
             "pass6": sum(numeric_score_is_one(row["extracted_score"]) for row in latest),
             "pass6_denominator": len(latest),
             "eligible_rollouts": len(completed),
@@ -665,6 +817,8 @@ def prepare_and_label(
     run_dir: Path,
     pipeline_root: Path,
     tool_root: Path,
+    jobs: int = 12,
+    label_concurrency: int = 16,
 ) -> dict[str, Path]:
     annotation_tool = tool_root / ".venv/bin/annotation-tool"
     labeler = pipeline_root / "label_rp.py"
@@ -674,7 +828,7 @@ def prepare_and_label(
         raise SystemExit(f"R/P labeler not found: {labeler}")
     outputs = run_dir / "outputs"
     outputs.mkdir(parents=True, exist_ok=True)
-    for name in task_names:
+    def prepare_one(name: str) -> None:
         run_checked(
             [
                 str(annotation_tool),
@@ -687,6 +841,11 @@ def prepare_and_label(
             ],
             cwd=tool_root,
         )
+
+    print(f"preparing {len(task_names)} task packets with {jobs} workers ...",
+          file=sys.stderr, flush=True)
+    with cf.ThreadPoolExecutor(jobs) as pool:
+        list(pool.map(prepare_one, task_names))
 
     key_path, remove_key = prepare_worker_key()
     try:
@@ -701,7 +860,7 @@ def prepare_and_label(
                 "--chunk",
                 "40",
                 "--concurrency",
-                "8",
+                str(label_concurrency),
             ],
             capture=False,
         )
@@ -709,12 +868,13 @@ def prepare_and_label(
         if remove_key and key_path.exists():
             key_path.unlink()
 
-    result: dict[str, Path] = {}
-    for name in task_names:
-        output = outputs / name
-        merge_and_finalize(output, annotation_tool, tool_root)
-        result[name] = output / "annotated_trajectories.json"
-    return result
+    print(f"merging {len(task_names)} annotations with {jobs} workers ...",
+          file=sys.stderr, flush=True)
+    with cf.ThreadPoolExecutor(jobs) as pool:
+        list(pool.map(
+            lambda name: merge_and_finalize(outputs / name, annotation_tool, tool_root),
+            task_names))
+    return {name: outputs / name / "annotated_trajectories.json" for name in task_names}
 
 
 def merge_and_finalize(output: Path, annotation_tool: Path, tool_root: Path) -> None:
@@ -847,10 +1007,15 @@ def analyse_tasks(
     run_dir: Path,
     pipeline_root: Path,
     tool_root: Path,
+    jobs: int = 12,
+    label_concurrency: int = 16,
 ) -> list[dict[str, Any]]:
     metadata = load_task_metadata(db, task_ids)
     rollout_data = load_rollouts(db, task_ids)
+    # Directory names are assigned serially -- collision handling depends on what
+    # has been claimed so far -- but the exports themselves are independent.
     names: dict[str, str] = {}
+    exports: list[tuple[str, str]] = []
     for task_id in task_ids:
         representative = rollout_data[task_id]["representative"]
         if not representative:
@@ -859,14 +1024,19 @@ def analyse_tasks(
         if dirname in names.values():
             dirname = f"{dirname}__{task_id[:8]}"
         names[task_id] = dirname
-        export_messages(
-            db,
-            representative["rollout_id"],
-            run_dir / "tasks" / dirname,
-        )
+        exports.append((representative["rollout_id"], dirname))
+
+    if exports:
+        print(f"exporting {len(exports)} trajectories with {jobs} workers ...",
+              file=sys.stderr, flush=True)
+        with cf.ThreadPoolExecutor(jobs) as pool:
+            list(pool.map(
+                lambda pair: export_messages(db, pair[0], run_dir / "tasks" / pair[1]),
+                exports))
 
     paths = prepare_and_label(
-        list(names.values()), run_dir, pipeline_root, tool_root
+        list(names.values()), run_dir, pipeline_root, tool_root,
+        jobs=jobs, label_concurrency=label_concurrency,
     )
     result = []
     for task_id in task_ids:
@@ -926,7 +1096,28 @@ h1,p {{ margin:0; }}
 .summary {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }}
 .card {{ border:1px solid var(--border); background:var(--card); border-radius:10px; padding:14px; display:grid; gap:4px; }}
 .value {{ font-size:1.8rem; font-weight:650; }}
-.toolbar {{ display:flex; align-items:center; gap:8px; }}
+.tablewrap {{ overflow-x:auto; border:1px solid var(--border); border-radius:10px; }}
+.tablewrap table {{ margin:0; }}
+.tablewrap th, .tablewrap td {{ white-space:nowrap; }}
+.tablewrap th:first-child, .tablewrap td:first-child {{ position:sticky; left:0;
+  background:var(--bg); z-index:2; min-width:230px; white-space:normal; }}
+.tablewrap th:nth-child(2), .tablewrap td:nth-child(2) {{ position:sticky; left:230px;
+  background:var(--bg); z-index:2; }}
+.tablewrap td:nth-child(9) {{ max-width:150px; overflow:hidden; text-overflow:ellipsis; }}
+.toolbar {{ display:flex; flex-wrap:wrap; align-items:flex-end; gap:10px 14px;
+  padding:12px 14px; border:1px solid var(--border); border-radius:10px;
+  background:var(--card); margin:14px 0 4px; }}
+.filter {{ display:flex; flex-direction:column; gap:4px; min-width:0; }}
+.filter > span {{ font-size:.74rem; letter-spacing:.02em; text-transform:uppercase;
+  color:var(--muted); white-space:nowrap; }}
+.filter select {{ min-width:132px; max-width:230px; }}
+.toolbar .spacer {{ flex:1 1 auto; }}
+.toolbar .actions {{ display:flex; align-items:center; gap:10px; }}
+#shown {{ white-space:nowrap; font-variant-numeric:tabular-nums; }}
+#reset {{ font:inherit; font-size:.85rem; color:inherit; background:var(--bg);
+  border:1px solid var(--border); border-radius:7px; padding:7px 12px; cursor:pointer; }}
+#reset:hover {{ border-color:var(--muted); }}
+#reset[disabled] {{ opacity:.45; cursor:default; }}
 select {{ font:inherit; color:inherit; background:var(--bg); border:1px solid var(--border); border-radius:7px; padding:6px 9px; }}
 .table-wrap {{ overflow-x:clip; }}
 table {{ width:100%; min-width:0; table-layout:fixed; border-collapse:collapse; font-size:clamp(12px,.95vw,15px); }}
@@ -963,11 +1154,23 @@ footer {{ display:grid; gap:4px; border-top:1px solid var(--border); padding-top
     <div class="card"><span class="muted">Pass@6 below 2</span><span id="pass6-count" class="value">0</span><span class="muted small">of {len(rows)} tasks</span></div>
     <div class="card"><span class="muted">Argus Main pass</span><span id="argus-count" class="value">0</span><span class="muted small">of {len(rows)} tasks</span></div>
   </section>
-  <div class="toolbar"><label for="shape-filter" class="muted">Shape</label><select id="shape-filter"><option value="all">All shapes</option><option>Diagnosis</option><option>Migration</option><option>Optimization</option></select></div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Task</th><th>Shape</th><th class="center">AI rubrics</th><th class="center">Gemini 3.7 Pass@6</th><th class="center">Argus Main</th><th class="center">R/P rollout</th><th class="right">Leading R/P</th><th class="center" title="Final successful RESEARCH_AND_PLANNING.md write step">R/P complete step</th><th class="right">Total R/P</th><th class="right">Tool calls</th><th class="center">Fit for pilot</th></tr></thead>
+  <div class="toolbar">
+    <label class="filter" for="fit-filter"><span>Fit for pilot</span><select id="fit-filter"><option value="all">Any</option><option value="YES">YES</option><option value="NO">NO</option></select></label>
+    <label class="filter" for="shape-filter"><span>Shape</span><select id="shape-filter"><option value="all">All shapes</option><option>Diagnosis</option><option>Migration</option><option>Optimization</option></select></label>
+    <label class="filter" for="rubric-filter"><span>AI rubrics</span><select id="rubric-filter"><option value="all">Any</option><option value="Pass">Pass</option><option value="Fail">Fail</option><option value="None">No reviews</option></select></label>
+    <label class="filter" for="argus-filter"><span>Argus Main</span><select id="argus-filter"><option value="all">Any</option><option value="Pass">Pass</option><option value="Fail">Fail</option><option value="In Progress">In progress</option><option value="Missing">Missing</option></select></label>
+    <label class="filter" for="glm-filter"><span>GLM</span><select id="glm-filter"><option value="all">Any</option><option value="fails">Fails (&lt;2)</option><option value="solves">Solves (&ge;2)</option><option value="none">No rollouts</option></select></label>
+    <label class="filter" for="router-filter"><span>Router</span><select id="router-filter"><option value="all">Any</option><option value="fails">Fails (&lt;2)</option><option value="solves">Solves (&ge;2)</option><option value="none">No rollouts</option></select></label>
+    <label class="filter" for="starfall-filter"><span>Starfall</span><select id="starfall-filter"><option value="all">Any</option><option value="fails">Fails (&lt;2)</option><option value="solves">Solves (&ge;2)</option><option value="none">No rollouts</option></select></label>
+    <label class="filter" for="repo-filter"><span>Repository</span><select id="repo-filter"><option value="all">All repositories</option></select></label>
+    <label class="filter" for="lang-filter"><span>Language</span><select id="lang-filter"><option value="all">All languages</option></select></label>
+    <span class="spacer"></span>
+    <span class="actions"><span id="shown" class="muted small"></span><button id="reset" type="button">Reset filters</button></span>
+  </div>
+  <div class="table-wrap"><div class="tablewrap"><table>
+    <thead><tr><th>Task</th><th class="center">Fit</th><th>Shape</th><th class="center">AI rubrics</th><th class="center" title="cipher-omni">GLM Pass@6</th><th class="center" title="router-16a8dce2a6e7">Router Pass@6</th><th class="center" title="starfall">Starfall Pass@6</th><th>Language</th><th>Repository</th><th class="center">Argus Main</th><th class="center">R/P rollout</th><th class="right">Leading R/P</th><th class="center" title="Final successful RESEARCH_AND_PLANNING.md write step">R/P complete step</th><th class="right">Total R/P</th><th class="right">Tool calls</th></tr></thead>
     <tbody id="rows"></tbody>
-  </table></div>
+  </table></div></div>
   <footer>
     <p>Fit requires AI rubrics Pass, fewer than 2 passes among available completed eligible Gemini 3.7 rollouts, Argus Main Pass, and an R/P complete step greater than 20. If no completion step is available, more than 20 leading R/P calls satisfies the R/P gate. A denominator from 1 to 6 is valid.</p>
     <p>Pass@6 uses up to the latest six completed Starfall or router-16a8dce2a6e7 rollouts with more than 10 reconstructed assistant turns. Only a score of exactly 1 counts as Pass.</p>
@@ -987,23 +1190,71 @@ document.querySelector('#pass6-count').textContent=ordered.filter(row=>row.pass6
 document.querySelector('#argus-count').textContent=ordered.filter(row=>row.argus_main==='Pass').length;
 const tbody=document.querySelector('#rows');
 const filter=document.querySelector('#shape-filter');
+const fitFilter=document.querySelector('#fit-filter');
+const rubricFilter=document.querySelector('#rubric-filter');
+const argusFilter=document.querySelector('#argus-filter');
+const glmFilter=document.querySelector('#glm-filter');
+const routerFilter=document.querySelector('#router-filter');
+const starfallFilter=document.querySelector('#starfall-filter');
+const repoFilter=document.querySelector('#repo-filter');
+const langFilter=document.querySelector('#lang-filter');
+const shown=document.querySelector('#shown');
+// Repository and language options are built from the data, so the dropdown can
+// never offer a value no row has.
+for(const [sel,key] of [[repoFilter,'repo_key'],[langFilter,'lang_key']]){{
+  [...new Set(DATA.map(r=>r[key]).filter(Boolean))].sort().forEach(v=>{{
+    const o=document.createElement('option'); o.value=v; o.textContent=v; sel.appendChild(o);
+  }});
+}}
 function render(){{
-  tbody.innerHTML=ordered.filter(row=>filter.value==='all'||row.shape===filter.value).map(row=>`<tr>
-    <td><span class="task-name">${{esc(row.name)}}</span><a class="task-id" href="https://horizon.bespokelabs.ai/tasks/${{encodeURIComponent(row.task_id)}}" target="_blank" rel="noopener noreferrer">${{esc(row.task_id)}}</a></td>
+  const modelOk=(row,key,want)=>{{
+    if(want==='all') return true;
+    const m=(row.per_model||{{}})[key];
+    const n=m&&m.denominator?m.denominator:0;
+    if(want==='none') return n===0;
+    if(n===0) return false;                       // no rollouts is not a pass or a fail
+    return want==='fails' ? m.pass6<2 : m.pass6>=2;
+  }};
+  // Every active control is ANDed: "router fails AND rubrics pass AND repo=x".
+  const visible=ordered.filter(row=>
+       (fitFilter.value==='all'||row.fit===fitFilter.value)
+    && (filter.value==='all'||row.shape===filter.value)
+    && (rubricFilter.value==='all'||row.ai_rubrics===rubricFilter.value)
+    && (argusFilter.value==='all'||row.argus_main===argusFilter.value)
+    && modelOk(row,'glm',glmFilter.value)
+    && modelOk(row,'router',routerFilter.value)
+    && modelOk(row,'starfall',starfallFilter.value)
+    && (repoFilter.value==='all'||(row.repo_key||'')===repoFilter.value)
+    && (langFilter.value==='all'||(row.lang_key||'')===langFilter.value));
+  const active=allFilters.filter(sel=>sel.value!=='all').length;
+  shown.textContent=active
+    ? `${{visible.length}} of ${{ordered.length}} shown · ${{active}} filter${{active>1?'s':''}}`
+    : `${{ordered.length}} tasks`;
+  resetBtn.disabled=active===0;
+  tbody.innerHTML=visible.map(row=>`<tr>
+    <td><span class="task-name">${{esc(row.name)}}</span><a class="task-id" href="https://horizon.bespokelabs.ai/tasks/${{encodeURIComponent(row.task_id)}}" target="_blank" rel="noopener noreferrer">${{esc(row.task_id)}}</a>${{row.rubrics_source||row.rollouts_source?`<span class="muted small"> rubrics:${{esc(row.rubrics_source||'none')}} · rollouts:${{esc(row.rollouts_source||'none')}}</span>`:''}}</td>
+    <td class="center"><span class="${{row.fit==='YES'?'fit-yes':'fit-no'}}">${{row.fit}}</span></td>
     <td>${{esc(row.shape)}}</td>
     <td class="center"><span class="${{statusClass(row.ai_rubrics)}}" title="${{row.ai_count}} applicable reviews">${{esc(row.ai_rubrics)}}</span></td>
-    <td class="center"><span class="${{row.pass6<2?'pass6-good':'pass6-bad'}}" title="Latest ${{row.pass6_denominator}} of ${{row.eligible_rollouts}} completed eligible rollouts. ${{row.incomplete_rollouts}} incomplete excluded.">${{row.pass6}}/${{row.pass6_denominator}}</span></td>
+    ${{['glm','router','starfall'].map(k=>{{const m=(row.per_model||{{}})[k];
+      if(!m||!m.denominator) return '<td class="center"><span class="muted">—</span></td>';
+      return `<td class="center"><span class="${{m.pass6<2?'pass6-good':'pass6-bad'}}" title="latest ${{m.denominator}} eligible rollouts, median ${{m.median_turns??'?'}} assistant turns">${{m.pass6}}/${{m.denominator}}</span>${{m.median_turns!=null?` <span class="muted small">${{m.median_turns}}t</span>`:''}}</td>`;}}).join('')}}
+    <td>${{esc(row.lang_key||'—')}}</td>
+    <td class="small" title="${{esc(row.repo_key||'')}}">${{esc((row.repo_key||'—').replace(/^github\.com\//,''))}}</td>
     <td class="center"><span class="${{statusClass(row.argus_main)}}">${{esc(row.argus_main)}}</span></td>
     <td class="center"><span class="${{row.rollout_source?.startsWith('Fallback:')?'progress':''}}" title="${{esc(row.representative_created_at??'No representative rollout')}}">${{esc(row.rollout_source??'Completed')}}</span></td>
     <td class="right">${{row.leading_rp}}</td>
     <td class="center">${{row.rp_complete_step??'—'}}</td>
     <td class="right">${{row.total_rp}}</td>
     <td class="right">${{row.tool_calls}}</td>
-    <td class="center"><span class="${{row.fit==='YES'?'fit-yes':'fit-no'}}">${{row.fit}}</span></td>
   </tr>`).join('');
   parent.postMessage({{type:'pilot-report-height',height:document.documentElement.scrollHeight}},'*');
 }}
-filter.addEventListener('change',render); render();
+const allFilters=[fitFilter,filter,rubricFilter,argusFilter,glmFilter,routerFilter,starfallFilter,repoFilter,langFilter];
+const resetBtn=document.querySelector('#reset');
+for(const sel of allFilters) sel.addEventListener('change',render);
+resetBtn.addEventListener('click',()=>{{ for(const sel of allFilters) sel.value='all'; render(); }});
+render();
 new ResizeObserver(()=>parent.postMessage({{type:'pilot-report-height',height:document.documentElement.scrollHeight}},'*')).observe(document.body);
 </script>
 </body></html>"""
@@ -1017,12 +1268,12 @@ def make_outer_html(inner: str) -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:; connect-src 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:; connect-src 'none'; frame-src 'self'; child-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>Pilot task analysis</title>
 <style>html,body{{margin:0;background:#fff}}iframe{{display:block;width:100%;height:100vh;border:0}}</style>
 </head>
 <body>
-<iframe id="report" sandbox="allow-scripts" scrolling="no" referrerpolicy="no-referrer" title="Pilot task analysis" data-srcdoc="{encoded}"></iframe>
+<iframe id="report" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" scrolling="no" referrerpolicy="no-referrer" title="Pilot task analysis" data-srcdoc="{encoded}"></iframe>
 <script>
 const frame=document.querySelector('#report');
 frame.srcdoc=frame.dataset.srcdoc;
@@ -1060,6 +1311,204 @@ def write_outputs(rows: list[dict[str, Any]], output: Path) -> None:
     print(f"Data: {sidecar}")
 
 
+SIGNAL_KEYS = {
+    "rubrics": ("ai_rubrics", "ai_rubrics_strict", "grader_coverage",
+                "ai_reviews", "argus_reviews", "ai_count", "argus_main", "shape"),
+    "rollouts": ("pass6", "pass6_denominator", "eligible_rollouts", "per_model",
+                 "rollout_source", "representative_created_at", "turns_median", "turns_max", "rollouts_n",
+                 "leading_rp", "total_rp", "tool_calls", "rp_complete_step"),
+}
+
+
+def _has_rubrics(row: dict[str, Any]) -> bool:
+    return bool(row.get("ai_reviews")) or row.get("argus_main") not in (None, "", "Missing")
+
+
+def _has_rollouts(row: dict[str, Any]) -> bool:
+    return int(row.get("pass6_denominator") or 0) > 0
+
+
+def collapse_variants(rows: list[dict[str, Any]],
+                      groups: list[dict[str, Any]],
+                      enrich: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per logical task, with each SIGNAL taken from the first variant
+    that actually carries it (final -> binary -> partial).
+
+    Rubrics and rollouts are resolved INDEPENDENTLY: a task routinely has its
+    rubrics on one variant and its rollouts on another, because the partial
+    variant is the one quality gating was run against. Every borrowed signal
+    records the variant it came from, so a verdict can be audited back to the
+    exact task id that supplied its evidence -- a merged row whose provenance is
+    invisible is not reviewable.
+    """
+    by_id = {row["task_id"]: row for row in rows}
+    collapsed: list[dict[str, Any]] = []
+    for group in groups:
+        present = [(name, group[name]) for name in VARIANT_ORDER
+                   if group.get(name) and group[name] in by_id]
+        if not present:
+            continue
+        base_name, base_id = present[0]
+        merged: dict[str, Any] = dict(by_id[base_id])
+        merged["variants"] = {name: tid for name, tid in present}
+        merged["responsible"] = group.get("responsible", "")
+
+        # TWO DIFFERENT THINGS ARE CALLED "VERSION"; only one of them inherits.
+        #   Horizon task_version  -> ALWAYS take the LATEST. An older Horizon
+        #                            version passing does not excuse the current one.
+        #   CSV column            -> final / binary / partial. THESE inherit: the
+        #                            same rubric is re-fired against each shipped
+        #                            variant, so a pass on any of the three settles
+        #                            it and you stop looking.
+        # Taking rubrics wholesale from the first variant that has ANY rows reads
+        # a fail on the copy while the source has passed the same rubric ten times.
+        # TWO RULES, IN ORDER.
+        #  1. WITHIN a variant only the LATEST run of a rubric counts -- a re-fired
+        #     rubric has a current answer and older runs are history. Retired
+        #     rubric sets leave stale rows behind (one task carries 31 rubrics,
+        #     19 of them historical).
+        #  2. ACROSS variants, in CSV order final -> binary -> partial, the first
+        #     variant whose LATEST run passes settles that rubric and you stop.
+        #     If no variant's latest run passes, the most recent failing run is
+        #     what gets reported.
+        def latest_per_name(reviews):
+            out: dict[str, dict[str, Any]] = {}
+            for review in reviews or []:
+                name = review.get("rubric_name")
+                if not name:
+                    continue
+                held = out.get(name)
+                if held is None or str(review.get("created_at") or "") > str(
+                        held.get("created_at") or ""):
+                    out[name] = review
+            return out
+
+        per_variant = [(vname, latest_per_name(by_id[tid].get("ai_reviews")))
+                       for vname, tid in present]
+        settled: dict[str, dict[str, Any]] = {}
+        settled_by: dict[str, str] = {}
+        for rname in {n for _, latest in per_variant for n in latest}:
+            fallback = None
+            for vname, latest in per_variant:
+                review = latest.get(rname)
+                if review is None:
+                    continue
+                if ai_review_passes(review, ignore_grader_coverage=False):
+                    settled[rname] = review
+                    settled_by[rname] = vname
+                    break
+                if fallback is None or str(review.get("created_at") or "") > str(
+                        fallback.get("created_at") or ""):
+                    fallback = review
+            if rname not in settled and fallback is not None:
+                settled[rname] = fallback
+                settled_by[rname] = "none-passed"
+        merged["ai_reviews_merged"] = list(settled.values())
+        merged["rubric_settled_by"] = settled_by
+
+        for signal, keys in SIGNAL_KEYS.items():
+            probe = _has_rubrics if signal == "rubrics" else _has_rollouts
+            source = next((n for n, t in present if probe(by_id[t])), None)
+            merged[f"{signal}_source"] = source
+            if source:
+                donor = by_id[group[source]]
+                for key in keys:
+                    if key in donor:
+                        merged[key] = donor[key]
+
+        argus_pick = argus_from = None
+        for vname, tid in present:
+            runs = by_id[tid].get("argus_reviews") or []
+            if not runs:
+                continue
+            newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
+            if argus_pick is None:
+                argus_pick, argus_from = newest, vname
+            if classify_argus(newest) == "Pass":
+                argus_pick, argus_from = newest, vname
+                break
+        if argus_pick is not None:
+            merged["argus_main"] = classify_argus(argus_pick)
+            merged["argus_settled_by"] = argus_from
+
+        # Recompute the verdict from the merged, pass-inherited set.
+        merged_reviews = merged.get("ai_reviews_merged") or []
+        strict = merged.get("rubrics_source") == "partial"
+        if not merged_reviews:
+            merged["ai_rubrics"] = "None"
+        else:
+            merged["ai_rubrics"] = (
+                "Pass"
+                if all(ai_review_passes(r, ignore_grader_coverage=not strict)
+                       for r in merged_reviews)
+                else "Fail")
+        merged["ai_count"] = len(merged_reviews)
+        merged["failing_rubrics"] = sorted(
+            r.get("rubric_name", "?") for r in merged_reviews
+            if not ai_review_passes(r, ignore_grader_coverage=not strict))
+        merged["rubric_variants_merged"] = [name for name, _ in present]
+        facts = next((enrich[t] for _, t in present
+                      if t in enrich and enrich[t].get("repo_key")), None)
+        merged["repo_key"] = (facts or {}).get("repo_key", "")
+        merged["lang_key"] = (facts or {}).get("lang_key", "")
+        merged["base_commit"] = (facts or {}).get("base_commit", "")
+        merged["fit"] = fit_for_pilot(merged)
+        collapsed.append(merged)
+    return collapsed
+
+
+def diversity_summary(rows: list[dict[str, Any]], max_per_repo: int,
+                      max_lang_share: float) -> dict[str, Any]:
+    """Pool-level gates over the FIT rows only.
+
+    An unknown repository is not a repository: bucketing every unreadable task
+    under one key makes them collide and breaches a cap that was never actually
+    evaluated. Unknowns are counted separately and reported as unchecked.
+    """
+    fit = [row for row in rows if row.get("fit") == "YES"]
+
+    # SAME REPO + SAME COMMIT is a stronger duplication signal than repo alone:
+    # two tasks cut from one artifact share their whole source tree. Commits are
+    # compared by PREFIX because the pool stores the same hash at different
+    # lengths (40b0ab56da3682c2... on one task, 40b0ab56 on another), so string
+    # equality silently calls one artifact two.
+    shared_artifact: list[dict[str, Any]] = []
+    by_repo: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for row in fit:
+        if row.get("repo_key") and row.get("base_commit"):
+            by_repo[row["repo_key"]].append(row)
+    for repo, members in by_repo.items():
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                left = members[i].get("base_commit") or ""
+                right = members[j].get("base_commit") or ""
+                shortest = min(left, right, key=len)
+                if shortest and left.startswith(shortest) and right.startswith(shortest):
+                    shared_artifact.append({
+                        "repo": repo,
+                        "commit": shortest,
+                        "tasks": [members[i].get("name"), members[j].get("name")],
+                        "match": "exact" if left == right else "prefix",
+                    })
+
+    repos = collections.Counter(row.get("repo_key") or "(unknown)" for row in fit)
+    langs = collections.Counter(row.get("lang_key") or "(unknown)" for row in fit)
+    total = len(fit)
+    return {
+        "fit_count": total,
+        "repos": dict(repos),
+        "languages": dict(langs),
+        "repo_breaches": {r: n for r, n in repos.items()
+                          if r != "(unknown)" and n > max_per_repo},
+        "language_breaches": {l: n for l, n in langs.items()
+                              if l != "(unknown)" and total and n / total > max_lang_share},
+        "shared_artifact_pairs": shared_artifact,
+        "unchecked_repo": repos.get("(unknown)", 0),
+        "max_per_repo": max_per_repo,
+        "max_lang_share": max_lang_share,
+    }
+
+
 def main() -> None:
     args = parse_args()
     task_ids = collect_task_ids(args)
@@ -1086,7 +1535,18 @@ def main() -> None:
                 run_dir,
                 args.pipeline_root.expanduser(),
                 args.tool_root.expanduser(),
+                jobs=args.jobs,
+                label_concurrency=args.label_concurrency,
             )
+        enrich: dict[str, dict[str, Any]] = {}
+        if getattr(args, "enrich", None) and args.enrich.is_file():
+            enrich = {e["task_id"]: e for e in
+                      json.loads(args.enrich.read_text(encoding="utf-8")).get("tasks", [])}
+        groups = getattr(args, "variant_groups", None)
+        if groups:
+            new_rows = collapse_variants(new_rows, groups, enrich)
+            args.diversity = diversity_summary(
+                new_rows, args.max_per_repo, args.max_lang_share)
         by_id = {row["task_id"]: row for row in existing}
         for row in new_rows:
             by_id[row["task_id"]] = row
