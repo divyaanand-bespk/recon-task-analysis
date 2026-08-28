@@ -67,15 +67,27 @@ def diverse_order(rows: list[dict]) -> tuple[list[dict], dict]:
       1. BREADTH   maximise how many axes the pick leaves UNUSED-so-far.
                    A task fresh on all three beats one fresh on two, which beats
                    one fresh on one. No axis outranks another.
-      2. PRESSURE  when nothing is fully fresh, minimise summed relative
-                   over-use. Each axis is scored against its OWN fair share --
-                   `used / (picks_so_far / distinct_values)` -- because raw
-                   counts are not comparable across axes: repeating one of two
-                   languages is unavoidable, repeating one of thirty-four
-                   repositories is waste. Normalising stops the widest axis
-                   dominating simply by having more values.
-      3. QUALITY   most eligible rollouts, then highest median turns.
-      4. RANK      exact ties only.
+      2. FORGONE   when nothing is fully fresh, minimise what the repeat COSTS:
+                   for each axis the pick repeats, how many values on that axis
+                   are still UNUSED and still reachable in the remaining pool.
+                   Repeating a repository while ten sit unused forgoes ten
+                   chances; repeating one of two languages while one sits unused
+                   forgoes one. An exhausted axis scores zero, so a forced
+                   repeat is free -- there was nothing to give up.
+      3. SPREAD    among equally costly repeats, prefer the LEAST-used value, so
+                   picks fan out across an axis instead of piling onto one value.
+      4. QUALITY   most eligible rollouts, then highest median turns.
+      5. RANK      exact ties only.
+
+    An earlier version scored term 2 as relative over-use against each axis's
+    "fair share", `used / max(1, picks / distinct)`. That was blind in exactly
+    the region that matters. With 3 languages and 12 repositories, a candidate
+    opening the last free language while REUSING a repository and one opening a
+    fresh repository while reusing a language both scored 2.000 -- the clamp
+    pinned both denominators at 1.0 for the first several picks, so nothing in
+    the key knew one axis had ten free values left and the other had one. The
+    tie fell through to input order, and the list burned repositories it could
+    not afford inside a 50-task cut.
 
     Diversity is therefore spent only when the pool genuinely offers nothing
     fresher, and it is spent on whichever axis is least costly at that moment
@@ -90,26 +102,38 @@ def diverse_order(rows: list[dict]) -> tuple[list[dict], dict]:
     traded_total = [0]
     ordered: list[dict] = []
 
-    def key(r: dict):
-        picks = len(ordered)
+    def key(r: dict, unused_now: dict[str, int]):
         fresh = 0
-        pressure = 0.0
+        forgone = 0
+        spread = 0
         for field, _ in AXES:
             value = axis_value(r, field)
             count = used[field][value]
             if count == 0:
                 fresh += 1
-            # fair share for this axis: how many picks each of its values would
-            # carry if the axis were spread perfectly across the picks so far.
-            share = max(1.0, picks / max(1, distinct[field]))
-            pressure += count / share
-        return (-fresh, pressure,
+                continue
+            # THE COST OF A REPEAT IS WHAT IT GIVES UP. Count the values on this
+            # axis that are still unused AND still present in the pool: those are
+            # the chances this repeat forgoes. An exhausted axis gives up
+            # nothing, so a forced repeat costs nothing and never outranks a
+            # genuine choice.
+            forgone += unused_now[field]
+            spread += count
+        return (-fresh, forgone, spread,
                 -int(r.get("rollouts_n") or 0),
                 -int(r.get("turns_median") or 0),
                 r["_rank"])
 
     while pool:
-        pick = min(pool, key=key)
+        # how many values on each axis are still unused AND still obtainable.
+        # Recomputed per step: a value stops counting once the last row carrying
+        # it has been taken, so "forgone" only ever counts real, reachable options.
+        unused_now = {
+            field: len({axis_value(r, field) for r in pool
+                        if used[field][axis_value(r, field)] == 0})
+            for field, _ in AXES
+        }
+        pick = min(pool, key=lambda r: key(r, unused_now))
         pick["_fresh_axes"] = []
         pick["_spent_axes"] = []
         for field, label in AXES:

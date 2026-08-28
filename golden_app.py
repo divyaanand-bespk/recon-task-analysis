@@ -32,8 +32,8 @@ AX = (("lang_key", "language"), ("shape", "shape"), ("repo_key", "repository"))
 
 TERMS = [
     ("Breadth", "opens the most unused axes at once (3 &gt; 2 &gt; 1 &gt; 0)", "diversity"),
-    ("Pressure", "least relative over-use, each axis judged against its own fair share",
-     "diversity"),
+    ("Forgone", "cheapest repeat &mdash; fewest still-unused values given up", "diversity"),
+    ("Spread", "among equal repeats, the least-used value", "diversity"),
     ("Rollouts", "most eligible rollouts", "quality"),
     ("Turns", "highest median turns", "quality"),
     ("Rank", "existing rank (exact ties only)", "tiebreak"),
@@ -108,29 +108,40 @@ def norm_reason(text: str) -> str:
 
 # ------------------------------------------------------------------ selection
 
-def key_tuple(r, used, distinct, picks):
-    """The shipped five-term key, re-stated for explanation only.
+def key_tuple(r, used, unused_now):
+    """The shipped six-term key, re-stated for explanation only.
 
-    The axes are NOT ranked against each other. An earlier version put language
+    The axes are NOT ranked against each other. The first version put language
     first, shape second, repository third, which made language absolutely
     dominant: a task opening an unused language won even when it repeated both
     the shape and the repository before it. Given many tasks in ONE repository
     spread across many languages -- and repositories are multi-language -- that
     key would cycle languages forever and never leave the repository.
 
-    Term 1 counts how many axes the pick leaves untouched-so-far, so opening
-    three beats opening one regardless of WHICH. Term 2 breaks the remaining
-    ties by summed relative over-use, each axis measured against its own fair
-    share, so the widest axis cannot dominate merely by holding more values.
+    Term 1 counts how many axes the pick leaves untouched, so opening three
+    beats opening one regardless of WHICH. Term 2 prices what a repeat gives
+    up: the number of values on that axis still unused and still reachable in
+    the pool. Term 3 spreads picks across an axis rather than piling onto one
+    value.
+
+    Term 2 replaced a "relative over-use" score that was blind where it counted.
+    With 3 languages and 12 repositories, a candidate taking the last free
+    language while REUSING a repository and one taking a fresh repository while
+    reusing a language scored identically, because the fair-share denominator
+    stayed clamped at 1.0 through the early picks. The tie fell to input order
+    and the list burned repositories it could not afford inside a 50-task cut.
     """
     fresh = 0
-    pressure = 0.0
+    forgone = 0
+    spread = 0
     for field, _ in AX:
         c = used[field][axis(r, field)]
         if c == 0:
             fresh += 1
-        pressure += c / max(1.0, picks / max(1, distinct[field]))
-    return (-fresh, pressure,
+            continue
+        forgone += unused_now[field]
+        spread += c
+    return (-fresh, forgone, spread,
             -(num(r, "rollouts_n") or 0),
             -(num(r, "turns_median") or 0),
             r.get("_rank", 0))
@@ -148,11 +159,12 @@ def replay(ordered: list[dict]) -> tuple[list[dict], bool]:
     for i, r in enumerate(rows):
         r.setdefault("_rank", i)
     used = {f: collections.Counter() for f, _ in AX}
-    distinct = {f: len({axis(r, f) for r in rows}) for f, _ in AX}
     picks, faithful = [], True
     remaining = list(rows)
-    for n, chosen in enumerate(rows):
-        kf = lambda r: key_tuple(r, used, distinct, n)
+    for chosen in rows:
+        unused_now = {f: len({axis(r, f) for r in remaining
+                              if used[f][axis(r, f)] == 0}) for f, _ in AX}
+        kf = lambda r: key_tuple(r, used, unused_now)
         scored = sorted(remaining, key=kf)
         if scored[0] is not chosen:
             faithful = False
@@ -185,7 +197,9 @@ def local_order(rows: list[dict]) -> tuple[list[dict], dict]:
     unknown_n = {f: sum(1 for r in pool if axis(r, f) == "unknown") for f, _ in AX}
     out = []
     while pool:
-        pick = min(pool, key=lambda r: key_tuple(r, used, distinct, len(out)))
+        unused_now = {f: len({axis(r, f) for r in pool
+                              if used[f][axis(r, f)] == 0}) for f, _ in AX}
+        pick = min(pool, key=lambda r: key_tuple(r, used, unused_now))
         seq = len(out) + 1
         for field, _ in AX:
             val = axis(pick, field)
@@ -292,10 +306,12 @@ def rationale(pick: dict, position: int, faithful: bool) -> tuple[str, str]:
         if j == 0:
             detail = f"opened {-a} fresh {'axis' if -a == 1 else 'axes'} vs {-b}"
         elif j == 1:
-            detail = f"relative over-use {a:.2f} vs {b:.2f} across the three axes"
+            detail = f"its repeat gave up {a} still-free value(s) vs {b}"
         elif j == 2:
-            detail = f"{-a:,} eligible rollouts vs {-b:,}"
+            detail = f"repeated a value used {a}x vs one used {b}x"
         elif j == 3:
+            detail = f"{-a:,} eligible rollouts vs {-b:,}"
+        elif j == 4:
             detail = f"median {-a:,} turns vs {-b:,}"
         else:
             detail = "identical on every measured term; the earlier row wins"
@@ -946,8 +962,8 @@ def build(data: dict, enrich: dict | None, mod, import_note: str | None) -> str:
         # that "more fresh axes" sorts first; show it as the count the reader
         # expects. Pressure is a ratio, so two decimals -- an integer would
         # collapse most distinctions to 0.
-        kt = (f'<span class="keyt">key<br><b>{-k[0]} fresh</b> <b>{k[1]:.2f}</b>'
-              f'<br>{k[2]} {k[3]} {k[4]}</span>')
+        kt = (f'<span class="keyt">key<br><b>{-k[0]} fresh</b> <b>{k[1]}</b> <b>{k[2]}</b>'
+              f'<br>{k[3]} {k[4]} {k[5]}</span>')
         tid = r.get("task_id") or ""
         link = (f'<a href="{HORIZON}{esc(tid)}" target="_blank" rel="noopener noreferrer">'
                 f'{esc(r.get("name") or "unnamed task")}</a>') if tid else esc(r.get("name"))
@@ -1136,15 +1152,15 @@ def build(data: dict, enrich: dict | None, mod, import_note: str | None) -> str:
 
 {sec("At a glance", f'<div class="tiles">{"".join(tiles)}</div>')}
 
-{sec("The key", '''<h2>Five terms, read left to right</h2>
+{sec("The key", '''<h2>Six terms, read left to right</h2>
 <p class="sub">A pick wins on the first term where it beats every rival. Crucially the three axes
 &mdash; language, shape, repository &mdash; are <b>not ranked against each other</b>. Term&nbsp;1
 asks only <i>how many</i> of them a pick leaves untouched, so a task opening a new language
 <i>and</i> a new repo <i>and</i> a new shape beats one opening a new language alone. Ranking the
 axes was the old flaw: language came first, so with many tasks in one repository across many
 languages the list would cycle languages forever and never leave that repository. Term&nbsp;2
-settles the rest by relative over-use, each axis judged against its own fair share so the widest
-axis cannot win on cardinality. Quality only ever breaks ties between equally diverse
+prices what a repeat gives up &mdash; how many values on that axis are still unused and still
+reachable &mdash; so a forced repeat costs nothing and a wasteful one costs a lot. Quality only ever breaks ties between equally diverse
 candidates.</p>'''
   + f'<ul class="ladder">{"".join(ladder)}</ul>'
   + '<p class="note">Each pick shows its own key as a tuple in the left rail — the three '
