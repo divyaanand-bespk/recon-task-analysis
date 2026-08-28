@@ -301,9 +301,74 @@ change type (bugfix / feature_request), not the family.
 - **Match task identity on UUID, never name or prefix** — names collide across
   source and delivered copies.
 
+## Making changes
+
+Where things live, so a change lands in one place and not three.
+
+| You want to change | Edit | Then |
+|---|---|---|
+| Which tasks are included | `fit_for_pilot()` in `generate_pilot_analysis.py`, or pass `--gated` / omit it | re-run |
+| The pick order | `diverse_order()` in `render_report.py` **and** `key_tuple()` in `golden_app.py` | see below |
+| A diversity axis | `AXES` in `render_report.py` **and** `AX` in `golden_app.py` | see below |
+| The shared report | `make_report.py` | `"$PY" make_report.py out/work/pilot.json -o out/handover.html` |
+| The readiness page | `render_report.py` (`build()`) | re-render only, no Horizon access |
+| A new measured column | the SQL in `load_task_metadata()`, then surface it in the renderer | re-run |
+| Owner to shape mapping | `SHAPE_BY_OWNER` in `generate_pilot_analysis.py` | re-run |
+| Which files count as material | `MATERIAL` in `version_materiality.py` | delete `~/.cache/pilot-analysis/materiality`, re-run |
+| The pilot cut size | `TARGET` in `make_report.py`, `--target` for `render_report.py` | re-render |
+
+**THE SELECTION KEY EXISTS TWICE.** `render_report.diverse_order()` produces the
+order; `golden_app.key_tuple()` re-derives it to explain each pick and
+self-checks that replaying it reproduces the order. Change one without the other
+and the golden page silently says "local fallback" or "did not reproduce" and its
+explanations become fiction. After any ordering change:
+
+```bash
+source ./preflight.sh          # sets $PY; plain `python` is often not on PATH
+"$PY" - <<'EOF'
+import importlib.util, json
+def L(n,f):
+    sp=importlib.util.spec_from_file_location(n,f); m=importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m); return m
+rr=L("rr","render_report.py"); ga=L("ga","golden_app.py")
+rows=json.load(open("out/work/pilot.json"))["tasks"]
+o,d=rr.diverse_order(rows)
+print("replay faithful:", ga.replay(o)[1])
+print("axes optimal:", [(a["label"],a["optimal"],a["first_repeat"],a["floor"]) for a in d["axes"]])
+print("traded picks:", d["traded_picks"])
+EOF
+```
+
+`replay faithful: True` and every axis `optimal` is the bar. A first repeat
+EARLIER than the floor means diversity was spent that did not have to be.
+
+**Re-rendering is free.** `render_report.py`, `golden_app.py` and
+`make_report.py` all read `out/work/pilot.json` and touch nothing remote, so
+iterate on presentation without re-measuring or re-spending.
+
+**Before changing the ordering, reproduce the current behaviour on a synthetic
+pool first.** Two faults have already hidden in this key, and both were only
+visible on a constructed case, not on the real data:
+
+- Ranking the axes made language absolutely dominant, so with many tasks in ONE
+  repository across many languages it cycled languages and never left the repo.
+- Scoring a repeat by "relative over-use" was blind early on: with 3 languages
+  and 12 repositories, taking the last free language while REUSING a repository
+  scored identically to taking a fresh repository while reusing a language.
+
+The real sheet is too small and too uniform to expose either. Build a pool that
+does.
+
 ## Verify before reporting
 
 - `uv run --with pytest python -m pytest test_generator.py -q` — 10 tests.
 - The golden page must not say "local fallback" or "did not reproduce".
-- Sanity-check the axis table: `optimal` should be true on every axis unless the
-  pool genuinely forced a repeat.
+- Every axis `optimal`, unless the pool genuinely forced an early repeat.
+- **The shared report carries NO internal detail.** `out/handover.html` is what
+  gets sent outside the team: the golden cut, the full list, the mix. No repo
+  links, no branch names, no skill paths, no defect write-ups, no cost figures,
+  no per-task pass/fail verdict. Engineering detail belongs in this skill and in
+  the README, never on that page.
+- Quote which mode produced a report — gated, or every task included.
+- An empty result is not good news. Any query or filter that returns nothing
+  needs a positive control before you report it.

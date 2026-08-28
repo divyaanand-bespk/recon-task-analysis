@@ -143,6 +143,8 @@ ul.plain li{margin-bottom:.5rem}
 
 SHORT = {"Language": "Lang", "Shape": "Shape", "Repository": "Repo"}
 HORIZON = "https://horizon.bespokelabs.ai/tasks/"
+DASH = "\u2014"
+TARGET = 50  # the pilot asks for fifty; the rest stay listed below the cut
 
 
 def esc(v) -> str:
@@ -192,27 +194,34 @@ def build(data: dict, gated: bool) -> str:
         "rollouts": r.get("rollouts_n"), "turns": r.get("turns_median"),
         "rp": r.get("leading_rp"),
         "pass6": (f'{r.get("pass6")}/{r.get("pass6_denominator")}'
-                  if r.get("pass6_denominator") else "\u2014"),
+                  if r.get("pass6_denominator") else DASH),
         "fresh": r.get("_fresh_axes") or [], "spent": r.get("_spent_axes") or [],
     } for i, r in enumerate(ordered, 1)]
 
-    trs = "".join(
-        f'<tr><td class="n">{t["n"]}</td>'
-        f'<td><a href="{HORIZON}{esc(t["task_id"])}" target="_blank" '
-        f'rel="noopener noreferrer">{esc(t["name"])}</a>'
-        f'<div class="sub">{esc(t["owner"])}</div></td>'
-        f'<td>{esc(t["lang"])}</td><td>{esc(t["shape"])}</td>'
-        f'<td class="repo">{esc(t["repo"])}</td>'
-        f'<td class="axes">{chips(t)}</td>'
-        f'<td class="n">{esc(t["rollouts"] if t["rollouts"] is not None else "\u2014")}</td>'
-        f'<td class="n">{esc(t["turns"] if t["turns"] is not None else "\u2014")}</td>'
-        f'<td class="n">{esc(t["rp"])}</td><td class="n">{esc(t["pass6"])}</td></tr>'
-        for t in tasks)
+    def row(t):
+        return (f'<tr><td class="n">{t["n"]}</td>'
+                f'<td><a href="{HORIZON}{esc(t["task_id"])}" target="_blank" '
+                f'rel="noopener noreferrer">{esc(t["name"])}</a>'
+                f'<div class="sub">{esc(t["owner"])}</div></td>'
+                f'<td>{esc(t["lang"])}</td><td>{esc(t["shape"])}</td>'
+                f'<td class="repo">{esc(t["repo"])}</td>'
+                f'<td class="axes">{chips(t)}</td>'
+                f'<td class="n">{esc(t["rollouts"] if t["rollouts"] is not None else DASH)}</td>'
+                f'<td class="n">{esc(t["turns"] if t["turns"] is not None else DASH)}</td>'
+                f'<td class="n">{esc(t["rp"])}</td><td class="n">{esc(t["pass6"])}</td></tr>')
+
+    golden = "".join(row(t) for t in tasks[:TARGET])
+    n_golden = min(TARGET, len(tasks))
+    trs = "".join(row(t) for t in tasks)
 
     langs = collections.Counter(t["lang"] for t in tasks)
     shapes = collections.Counter(t["shape"] for t in tasks)
     owners = collections.Counter(t["owner"] for t in tasks)
     repos = collections.Counter(t["repo"] for t in tasks)
+
+    repo_rows = "".join(
+        f'<tr><td class="repo">{esc(name)}</td><td class="n">{count}</td></tr>'
+        for name, count in sorted(repos.items(), key=lambda kv: (-kv[1], kv[0])))
 
     axes = "".join(
         f'<tr><td>{esc(a["label"])}</td><td class="n">{a["distinct"]}</td>'
@@ -251,38 +260,41 @@ def build(data: dict, gated: bool) -> str:
 <header>
   <p class="eyebrow">Voyager pilot</p>
   <h1>The pilot task list</h1>
-  <p class="standfirst">All {n} tasks, ordered so each one differs from everything before it on as
-  many of language, shape and repository as the pool still allows. Where nothing fresh remains,
-  the next best task is taken rather than stopping.</p>
+  <p class="standfirst">The {n_golden} golden tasks for the pilot, chosen so each one differs
+  from everything before it on as many of language, shape and repository as the pool allows, and
+  the full list of all {n} tasks below them.</p>
   <div class="meta"><span>{time.strftime("%d %B %Y")}</span>
     <span>{n} tasks</span><span>{len(repos)} repositories</span>
-    <span>{"gated" if gated else "selection: diversity only"}</span></div>
+    <span>{len(langs)} languages</span><span>{len(shapes)} shapes</span></div>
 </header>
 
 <div class="tiles">
-  <a class="tile" href="#tasks" style="text-decoration:none;color:inherit">
-    <span class="v num">{n}</span><span class="k">Tasks</span><span class="s">in pick order &darr;</span></a>
+  <a class="tile" href="#golden" style="text-decoration:none;color:inherit">
+    <span class="v num">{n_golden}</span><span class="k">Golden tasks</span><span class="s">the pilot set &darr;</span></a>
+  <a class="tile" href="#all" style="text-decoration:none;color:inherit">
+    <span class="v num">{n}</span><span class="k">Full list</span><span class="s">every task</span></a>
   <div class="tile"><span class="v num">{len(repos)}</span><span class="k">Repositories</span>
     <span class="s">most-used appears {max(repos.values()) if repos else 0}&times;</span></div>
   <div class="tile"><span class="v num">{len(shapes)}</span><span class="k">Shapes</span>
     <span class="s">{esc(", ".join(sorted(shapes)))}</span></div>
-  <div class="tile"><span class="v num">{sum(1 for a in diag["axes"] if a["optimal"])}/{len(diag["axes"])}</span>
-    <span class="k">Axes optimal</span><span class="s">no avoidable repeat</span></div>
 </div>
 
-<section>
-  <h2>What this list is</h2>
-  <div class="prose">
-    <p>{basis}</p>
-    {optimal_note}
-  </div>
+<section id="golden">
+  <h2>The {n_golden} golden tasks</h2>
+  <div class="prose"><p>In pick order. Every task links to its Horizon record. The
+  <span class="ax new">Lang</span> chips mark an axis this task opened;
+  <span class="ax rep">Repo&middot;2</span> means it was the second task on that value.</p></div>
+  <div class="scroll tall"><table>
+    <thead><tr><th class="n">#</th><th>Task</th><th>Lang</th><th>Shape</th><th>Repository</th>
+      <th>Opened</th><th class="n">Rollouts</th><th class="n">Turns</th>
+      <th class="n">R/P</th><th class="n">pass6</th></tr></thead>
+    <tbody>{golden}</tbody>
+  </table></div>
 </section>
 
-<section id="tasks">
-  <h2>All {n} tasks, in pick order</h2>
-  <div class="prose"><p>The <span class="ax new">Lang</span> chips mark an axis this task opened;
-  <span class="ax rep">Repo&middot;2</span> means it was the second task on that value. Rollouts,
-  turns and research-and-planning are measurements, shown for context.</p></div>
+<section id="all">
+  <h2>All {n} tasks</h2>
+  <div class="prose"><p>The same order, carried on past the pilot cut.</p></div>
   <div class="scroll tall"><table>
     <thead><tr><th class="n">#</th><th>Task</th><th>Lang</th><th>Shape</th><th>Repository</th>
       <th>Opened</th><th class="n">Rollouts</th><th class="n">Turns</th>
@@ -309,18 +321,12 @@ def build(data: dict, gated: bool) -> str:
       <div class="scroll"><table><thead><tr><th>Author</th><th class="n">Tasks</th>
         <th class="n">Share</th><th></th></tr></thead>
         <tbody>{bar_rows(owners, n)}</tbody></table></div>
-      <h3>How the ordering did</h3>
-      <div class="scroll"><table><thead><tr><th>Axis</th><th class="n">Distinct</th>
-        <th class="n">Floor</th><th class="n">First repeat</th><th></th></tr></thead>
-        <tbody>{axes}</tbody></table></div>
-      <p class="sub" style="margin-top:.6rem">Floor = the earliest a repeat could happen
-      once every value on that axis has been used once.</p>
+      <h3>Repositories</h3>
+      <div class="scroll tall"><table><thead><tr><th>Repository</th><th class="n">Tasks</th>
+        </tr></thead><tbody>{repo_rows}</tbody></table></div>
     </div>
   </div>
 </section>
-
-<p class="foot">Generated by make_report.py from the measurement sidecar. Every figure is computed
-from the live Horizon database or the task files themselves, read-only.</p>
 </div>
 """
 
