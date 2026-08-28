@@ -1,2 +1,34 @@
-__pycache__/
+# Run artefacts: exported trajectories, annotation packets, R/P labels.
+# These contain task and rollout content and must never be committed.
 runs/
+outputs/
+
+# Generated reports and their JSON sidecars.
+pilot-task-analysis*.html
+pilot-task-analysis*.json
+pilot-report*.html
+pilot-report*.json
+pilot-*.html
+enrich*.json
+
+# Credentials. Nothing here should ever exist in the tree, but fail closed.
+.env
+.env.*
+hzkey
+*.key
+*-key.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+
+# Pristine upstream copy kept locally for diffing. It is byte-identical to the
+# tip of main, so git history already has it; committing it again would only
+# create a second file that looks like live code.
+*.orig
