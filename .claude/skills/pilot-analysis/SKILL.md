@@ -1,12 +1,29 @@
 ---
 name: pilot-analysis
-description: Run the Voyager pilot readiness and golden-set analysis - measure which Horizon tasks are fit for the pilot, pick a maximally diverse subset, and render the two HTML reports. Use when asked to refresh the pilot report, analyse a new task sheet, check task diversity, or pick the golden N tasks.
+description: Run the Voyager pilot task analysis via ./run_pilot.sh - measure Horizon tasks, order them for maximum diversity across language, shape and repository, and render the handover, golden-set and readiness reports. Use when asked to refresh the pilot report, analyse a new task sheet, check task diversity, or pick the golden N tasks.
 ---
 
 # Pilot analysis
 
-Measures Horizon tasks against the pilot bar, then orders the ones that pass
-so the selection is as diverse as the pool allows. Produces two HTML reports.
+Measures Horizon tasks, then orders them so the selection is as diverse as the
+pool allows. Produces three HTML reports.
+
+## Do this first
+
+```bash
+./run_pilot.sh "/path/to/Voyager Status and Milestones - Final List of tasks-N.csv"
+```
+
+That is the entire pipeline and it is what the handover shipped. It runs
+`preflight.sh`, derives the task ids from the sheet, enriches, computes version
+materiality, measures, and writes `out/handover.html`, `out/golden-set.html` and
+`out/pilot-readiness.html`. Add `--gated` to apply the fit gates instead of
+including every task.
+
+**Prefer it over running the stages by hand.** The manual sequence further down
+is for debugging one stage, not for producing a report. If `run_pilot.sh` fails,
+read what `preflight.sh` printed before doing anything else -- it names the exact
+fix for every precondition.
 
 **This pipeline never writes to Horizon.** Read-only throughout: no pushes, no
 rubric fires, no evaluations. If a task looks wrong, report it; do not fix it here.
@@ -69,7 +86,7 @@ Check for an existing `.env` in the pipeline checkout before asking anyone for
 a key; if there is none, ask the user rather than hunting, and suggest they put
 it in a file instead of pasting it into the conversation.
 
-## The run
+## The stages, if you need to run one by hand
 
 Enrichment first — the analysis reads its output. Rendering last, and repeatable
 on its own with no Horizon access at all.
@@ -172,7 +189,13 @@ self-checks that replaying it reproduces the order. **If you change the key in
 one file you must change it in both**, then confirm the page does not say
 "local fallback" or "did not reproduce".
 
-## What the two reports are
+## What the three reports are
+
+`make_report.py` -> **Handover** (`out/handover.html`): the page that gets
+shared. Every task in pick order with what each pick opened, plus the language,
+shape, author and axis mix. It shows no pass/fail verdict per task, because when
+the list includes every task a red chip beside an included one only invites the
+question the list already answered.
 
 `render_report.py` -> **Pilot Readiness**: every task in the sheet, each fit gate
 resolved, and a "Blocked by" reason for every task that misses. This is the

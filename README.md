@@ -1,5 +1,41 @@
 # Pilot analysis generator
 
+## Quick start
+
+```bash
+./run_pilot.sh "/path/to/Voyager Status and Milestones - Final List of tasks-N.csv"
+```
+
+That is the whole pipeline: preconditions, task ids, enrichment, version
+materiality, the measurement pass, and all three reports into `out/`.
+`./preflight.sh` on its own checks the preconditions and prints the exact fix
+for anything missing.
+
+The run needs two things you must provide:
+
+- **the proxy**, in its own terminal, because it is long-lived:
+  `cloud-sql-proxy --private-ip --port 15433 apex-485220:us-central1:horizon-db`
+- **`HORIZON_API_KEY`**, exported or in a `.env` beside the repo. Preflight finds
+  either. The same key is reused as the R/P worker key automatically.
+
+Everything else is discovered: the interpreter, `psql`, the database password.
+
+`run_pilot.sh` includes every task in the sheet and computes only the ORDER,
+which is what the handover shipped. Pass `--gated` to apply the fit gates
+(rubrics, Argus Main, pass6, research-and-planning) instead.
+
+Outputs, in `out/`:
+
+| file | what it is |
+|---|---|
+| `handover.html` | the shareable page: every task in pick order, plus the mix |
+| `golden-set.html` | the same order with the reasoning behind each pick |
+| `pilot-readiness.html` | every measured signal per task, filterable |
+
+Re-runs are cheap: enrichment, R/P labels and version digests are all cached, so
+adding five tasks to the sheet costs five tasks. Only R/P labelling ever costs
+money (about $11 from a completely cold start, near zero warm).
+
 The script accepts Horizon task IDs or task links and creates a self-contained HTML report. It keeps the tasks already present in the output file and adds or refreshes the supplied tasks. The first run starts with only the supplied tasks unless you pass an existing report with `--base-html`.
 
 Three further scripts sit around it. `diversity_enrich.py` attaches the repository and language of each task, which the database does not hold. `render_report.py` turns the JSON sidecar into a report without querying Horizon again. `select_pilot.py` picks the best N tasks under diversity caps. All four read every credential from the environment and none of them write to Horizon.

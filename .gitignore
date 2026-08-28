@@ -32,3 +32,4 @@ venv/
 # tip of main, so git history already has it; committing it again would only
 # create a second file that looks like live code.
 *.orig
+out/
