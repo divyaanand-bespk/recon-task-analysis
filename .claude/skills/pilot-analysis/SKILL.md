@@ -15,13 +15,28 @@ rubric fires, no evaluations. If a task looks wrong, report it; do not fix it he
 
 Check all three FIRST. Each has failed in a way that looks like something else.
 
-**1. The interpreter needs Python 3.11+ and the `horizon` package.**
+**1. The interpreter needs Python 3.11+, the `horizon` package, and `psql`.**
 macOS system `python3` is 3.9 and has no `tomllib`, so `diversity_enrich.py`
-dies on the import line. Use the venv that has both:
+dies on its import line. Find an interpreter that satisfies both rather than
+assuming one — it is usually a venv belonging to whichever checkout of
+`horizon` you have:
 
 ```bash
-PY=~/bespoke-repo/horizon/.venv/bin/python
-$PY -c "import horizon, tomllib; print('ok')"
+for c in $(command -v python3.13 python3.12 python3.11) \
+         "$(git rev-parse --show-toplevel 2>/dev/null)/.venv/bin/python" \
+         ~/*/horizon/.venv/bin/python ~/*/*/horizon/.venv/bin/python; do
+  [ -x "$c" ] && "$c" -c "import horizon, tomllib" 2>/dev/null && { PY="$c"; break; }
+done
+echo "${PY:?no interpreter has both python>=3.11 and the horizon package}"
+```
+
+`psql` must also be on PATH. `psycopg` is optional and, when absent, EVERY
+query falls back to `psql` — so a missing `psql` fails the whole run with
+`Required command not found: psql` even though the database is reachable. On
+macOS the libpq formula is keg-only and off PATH by default:
+
+```bash
+command -v psql || export PATH="$(brew --prefix libpq)/bin:$PATH"
 ```
 
 **2. The proxy must be listening, and the port is 15433 — not 5432.**
@@ -45,13 +60,14 @@ later connection fails with `server closed the connection unexpectedly` while
 the process is still running and still listening. That reads exactly like a
 database outage and has cost two runs.
 
-**3. `HORIZON_API_KEY` must be set** for `diversity_enrich.py` (API only, no
-database). If it is missing, ask the user to put it in a file rather than paste
-it into the conversation:
+**3. `HORIZON_API_KEY` must be set.** `diversity_enrich.py` needs it (API only,
+no database), and the measurement pass needs it AGAIN as the R/P worker key —
+the script does not mint one, it exits with `Set HORIZON_WORKER_KEY, set
+HORIZON_WORKER_KEY_FILE, or create /tmp/hzkey`. Export it under BOTH names.
 
-```bash
-printf %s 'KEY' > ~/.horizon-api-key && chmod 600 ~/.horizon-api-key
-```
+Check for an existing `.env` in the pipeline checkout before asking anyone for
+a key; if there is none, ask the user rather than hunting, and suggest they put
+it in a file instead of pasting it into the conversation.
 
 ## The run
 
@@ -59,8 +75,9 @@ Enrichment first — the analysis reads its output. Rendering last, and repeatab
 on its own with no Horizon access at all.
 
 ```bash
-PY=~/bespoke-repo/horizon/.venv/bin/python
-export HORIZON_API_KEY=$(cat ~/.horizon-api-key)
+# PY from step 1; CSV is the sheet you were given; ids extracted from it
+export HORIZON_API_KEY=...            # or: set -a; . path/to/.env; set +a
+export HORIZON_WORKER_KEY="$HORIZON_API_KEY"   # same key, second name
 export HORIZON_DB_ROLE=horizon_claude_ro
 export HORIZON_DB_SECRET=horizon-claude-ro-password
 
@@ -69,7 +86,7 @@ $PY diversity_enrich.py --task-file /tmp/task-ids.txt --out /tmp/enrich.json
 
 # 2. the measurement pass: rubrics, Argus, rollouts, turns, R/P labels
 $PY generate_pilot_analysis.py \
-  --task-csv "/path/to/Voyager Status and Milestones - Final List of tasks-N.csv" \
+  --task-csv "$CSV" \
   --enrich /tmp/enrich.json \
   --port 15433 --jobs 12 --label-concurrency 16 \
   --output /tmp/pilot.html
