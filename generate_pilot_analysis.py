@@ -13,6 +13,7 @@ import collections
 import concurrent.futures as cf
 import csv
 import html
+import io
 from html.parser import HTMLParser
 import json
 import os
@@ -22,10 +23,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 from urllib.parse import urlparse
 import uuid
+
+try:  # psycopg removes a process spawn AND a TLS handshake per query.
+    import psycopg as _psycopg
+except Exception:  # pragma: no cover - the psql path stays fully supported
+    _psycopg = None
 
 
 DEFAULT_BASE_HTML = Path(__file__).resolve().with_name("pilot-task-analysis-base.html")
@@ -135,6 +142,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep exported trajectories and annotation files after a successful run.",
     )
+    parser.add_argument(
+        "--rp-cache",
+        type=Path,
+        default=DEFAULT_RP_CACHE,
+        help="Directory of finalized R/P annotations keyed by rollout id. The"
+             " labelling pass is the run's dominant cost and is deterministic per"
+             " rollout, so a re-run only pays for rollouts it has not seen.")
+    parser.add_argument(
+        "--no-rp-cache",
+        action="store_true",
+        help="Label every rollout again, ignoring and not writing the cache.")
+    parser.add_argument(
+        "--seed-rp-cache",
+        action="store_true",
+        help="Before running, adopt annotations from kept run directories under"
+             " runs/ into the cache, then continue normally.")
     return parser.parse_args()
 
 
@@ -342,10 +365,29 @@ def load_existing_rows(path: Path) -> list[dict[str, Any]]:
 
 
 class HorizonDatabase:
+    """Read-only Horizon access over whichever local route is already up.
+
+    Every query used to be its own `psql` process: a spawn plus a fresh TLS
+    handshake through the proxy, measured at ~650 ms before the server does any
+    work. A psycopg connection, kept per thread, pays that once. The wire
+    format is left alone -- both routes run the SAME `COPY (...) TO STDOUT`
+    statement, so the server produces identical bytes and the psql path stays a
+    working fallback for anyone without psycopg installed.
+    """
+
     def __init__(self, port: int) -> None:
         self.port = port
         self.password = ""
         self.tunnel: subprocess.Popen[str] | None = None
+        self._local = threading.local()
+        self._connections: list[Any] = []
+        self._connection_lock = threading.Lock()
+        # PILOT_NO_PSYCOPG=1 forces the original psql path, which is the
+        # comparison used to prove the two routes agree.
+        self._use_psycopg = (
+            _psycopg is not None
+            and os.environ.get("PILOT_NO_PSYCOPG", "").strip() != "1"
+        )
 
     def __enter__(self) -> "HorizonDatabase":
         command_path("gcloud")
@@ -375,6 +417,13 @@ class HorizonDatabase:
         return self
 
     def __exit__(self, *_: object) -> None:
+        with self._connection_lock:
+            connections, self._connections = self._connections, []
+        for connection in connections:
+            try:
+                connection.close()
+            except Exception:
+                pass
         if self.tunnel is not None:
             self.tunnel.terminate()
             try:
@@ -444,8 +493,40 @@ class HorizonDatabase:
         detail = log.read()[-1200:]
         raise SystemExit(f"Could not open the read-only Horizon database tunnel.\n{detail}")
 
-    def csv(self, sql: str) -> list[dict[str, str]]:
-        statement = sql.strip().rstrip(";")
+    def _connection(self) -> Any:
+        """One connection per thread; the export pass runs in a thread pool."""
+        connection = getattr(self._local, "connection", None)
+        if connection is not None and not connection.closed:
+            return connection
+        connection = _psycopg.connect(
+            host="127.0.0.1",
+            port=self.port,
+            user=DB_ROLE,
+            dbname="horizon",
+            password=self.password,
+            connect_timeout=30,
+            # Without autocommit a COPY leaves a transaction open, and the
+            # read-only role sets idle_in_transaction_session_timeout=120s,
+            # which would kill a pooled connection between batches.
+            autocommit=True,
+        )
+        # The role is already SELECT-only; this is the second lock on the door.
+        connection.read_only = True
+        self._local.connection = connection
+        with self._connection_lock:
+            self._connections.append(connection)
+        return connection
+
+    def _csv_psycopg(self, copy_sql: str) -> str:
+        connection = self._connection()
+        blocks: list[bytes] = []
+        with connection.cursor() as cursor:
+            with cursor.copy(copy_sql) as copy:
+                for block in copy:
+                    blocks.append(bytes(block))
+        return b"".join(blocks).decode("utf-8", "replace")
+
+    def _csv_psql(self, copy_sql: str) -> str:
         result = run_checked(
             [
                 "psql",
@@ -458,11 +539,71 @@ class HorizonDatabase:
                 "-d",
                 "horizon",
                 "-c",
-                f"COPY ({statement}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)",
+                copy_sql,
             ],
             env=self.environment(),
         )
-        return list(csv.DictReader(result.stdout.splitlines()))
+        return result.stdout
+
+    def _query(self, copy_sql: str) -> str:
+        if self._use_psycopg:
+            try:
+                return self._csv_psycopg(copy_sql)
+            except _psycopg.OperationalError as exc:
+                # The route died, not the query. Drop a dead pooled connection
+                # and let the caller decide whether to retry.
+                connection = getattr(self._local, "connection", None)
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                    self._local.connection = None
+                raise RuntimeError(f"Connection lost: {exc}") from exc
+            except _psycopg.Error as exc:
+                raise RuntimeError(f"Query failed: {exc}") from exc
+        return self._csv_psql(copy_sql)
+
+    @staticmethod
+    def _is_connection_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            phrase in text
+            for phrase in (
+                "connection lost",
+                "server closed the connection",
+                "could not connect",
+                "connection refused",
+                "connection reset",
+                "terminating connection",
+                "ssl connection has been closed",
+                "the connection is closed",
+            )
+        )
+
+    def csv(self, sql: str, attempts: int = 4) -> list[dict[str, str]]:
+        statement = sql.strip().rstrip(";")
+        copy_sql = f"COPY ({statement}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)"
+        # The local proxy flaps -- an expired --token drops every connection at
+        # once -- and a run that dies at the export stage has already paid for
+        # its R/P labels. Only CONNECTION failures are retried; a statement
+        # timeout or a SQL error is reported on the first try, because retrying
+        # those just spends the same time again to fail the same way.
+        text = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                text = self._query(copy_sql)
+                break
+            except RuntimeError as exc:
+                if attempt == attempts or not self._is_connection_error(exc):
+                    raise
+                print(f"database connection lost (attempt {attempt}/{attempts}), "
+                      f"retrying in {attempt * 2}s", file=sys.stderr, flush=True)
+                time.sleep(attempt * 2)
+        # newline="" is the csv module's documented contract: it keeps a
+        # newline inside a quoted field -- trajectory content is full of them --
+        # from being read as a record boundary.
+        return list(csv.DictReader(io.StringIO(text, newline="")))
 
 
 def sql_ids(task_ids: list[str]) -> str:
@@ -553,35 +694,59 @@ def ai_review_passes(review: dict[str, Any],
     )
 
 
-def load_task_metadata(db: HorizonDatabase, task_ids: list[str]) -> dict[str, dict[str, Any]]:
-    ids = sql_ids(task_ids)
-    tasks = db.csv(
-        f"SELECT id::text AS task_id, name FROM task WHERE id IN ({ids})"
-    )
+def load_task_metadata(db: HorizonDatabase, task_ids: list[str],
+                       jobs: int = 12) -> dict[str, dict[str, Any]]:
+    # Chunked by task, for the same reason load_rollouts is: an IN list that
+    # grows with the sheet is a query whose runtime grows with the sheet, and
+    # the ceiling is a hard 120 s statement timeout, not a slow report.
+    #
+    # This query is NOT currently near that ceiling -- measured against the 2000
+    # tasks in Horizon carrying the MOST rubric rows, four times the pilot
+    # sheet's density, it returns 45,219 rows in 48 s, and its cost per task
+    # FALLS as the list grows because the plan is index-driven throughout
+    # (idx_rubric_ai_reviews_task_id, and the findings subquery is memoized at
+    # 0.003 ms a row). Chunking is here so the question never has to be asked
+    # again at 300 or 3000 tasks, and it wins back the wall-clock as a bonus.
+    #
+    # Chunking is only sound because DISTINCT ON dedupes WITHIN a task: no task
+    # spans two chunks, so each chunk resolves its own tasks completely and the
+    # rows for one task keep their relative order.
+    chunks = balanced_chunks(task_ids, jobs, TASK_METADATA_CHUNK)
+
+    def fetch_names(chunk: list[str]) -> list[dict[str, str]]:
+        return db.csv(
+            f"SELECT id::text AS task_id, name FROM task WHERE id IN ({sql_ids(chunk)})"
+        )
+
+    tasks = [row for rows in map_chunks(fetch_names, chunks, jobs) for row in rows]
     found = {row["task_id"]: {"name": row["name"]} for row in tasks}
     missing = [task_id for task_id in task_ids if task_id not in found]
     if missing:
         raise SystemExit(f"Task IDs not found in Horizon: {', '.join(missing)}")
 
-    reviews = db.csv(
-        f"""
-        SELECT DISTINCT ON (ar.task_id, ar.rubric_id)
-               ar.task_id::text AS task_id,
-               r.name AS rubric_name,
-               ar.status::text AS status,
-               ar.result::text AS result,
-               coalesce((
-                   SELECT jsonb_agg(f.severity::text ORDER BY f.finding_id)
-                   FROM rubric_ai_review_findings f
-                   WHERE f.rubric_ai_review_id = ar.id
-               ), '[]'::jsonb)::text AS finding_severities,
-               row_to_json(ar)::text AS review_json
-        FROM rubric_ai_reviews ar
-        JOIN rubrics r ON r.id = ar.rubric_id
-        WHERE ar.task_id IN ({ids})
-        ORDER BY ar.task_id, ar.rubric_id, ar.task_version DESC, ar.created_at DESC
-        """
-    )
+    def fetch_reviews(chunk: list[str]) -> list[dict[str, str]]:
+        ids = sql_ids(chunk)
+        return db.csv(
+            f"""
+            SELECT DISTINCT ON (ar.task_id, ar.rubric_id)
+                   ar.task_id::text AS task_id,
+                   r.name AS rubric_name,
+                   ar.status::text AS status,
+                   ar.result::text AS result,
+                   coalesce((
+                       SELECT jsonb_agg(f.severity::text ORDER BY f.finding_id)
+                       FROM rubric_ai_review_findings f
+                       WHERE f.rubric_ai_review_id = ar.id
+                   ), '[]'::jsonb)::text AS finding_severities,
+                   row_to_json(ar)::text AS review_json
+            FROM rubric_ai_reviews ar
+            JOIN rubrics r ON r.id = ar.rubric_id
+            WHERE ar.task_id IN ({ids})
+            ORDER BY ar.task_id, ar.rubric_id, ar.task_version DESC, ar.created_at DESC
+            """
+        )
+
+    reviews = [row for rows in map_chunks(fetch_reviews, chunks, jobs) for row in rows]
     grouped: dict[str, list[dict[str, Any]]] = {task_id: [] for task_id in task_ids}
     for row in reviews:
         record = json.loads(row["review_json"])
@@ -649,7 +814,103 @@ def numeric_score_is_one(value: str | None) -> bool:
         return False
 
 
-def load_rollouts(db: HorizonDatabase, task_ids: list[str]) -> dict[str, dict[str, Any]]:
+UUID_TEXT_GUARD = (
+    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    "-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# Chunk sizes are a statement-timeout budget, not a tuning knob. The read-only
+# role runs with statement_timeout=120s, and a query that trips it fails the
+# whole run -- so each query is sized to stay far below it whatever the sheet
+# grows to.
+MESSAGE_COUNT_CHUNK = 300
+MESSAGE_EXPORT_CHUNK = 24
+TASK_METADATA_CHUNK = 200
+
+
+def chunked(values: list[Any], size: int) -> list[list[Any]]:
+    return [values[i:i + size] for i in range(0, len(values), size)]
+
+
+def balanced_chunks(values: list[Any], jobs: int, cap: int) -> list[list[Any]]:
+    """Chunks wide enough to keep every worker busy, never wider than `cap`.
+
+    Batching and parallelism pull against each other: a fixed chunk size that
+    amortises the round trip also collapses 24 rollouts into two chunks, so ten
+    of twelve workers idle and the batched version loses to the unbatched one.
+    Measured: 24 exports took 5.9 s at a fixed size of 12 and 5.0 s here.
+    `cap` stays as the statement-timeout ceiling, not as the target.
+    """
+    if not values:
+        return []
+    size = max(1, -(-len(values) // max(1, jobs)))
+    return chunked(values, min(cap, size))
+
+
+def map_chunks(work: Any, chunks: list[Any], jobs: int) -> list[Any]:
+    """Run chunks in a pool, but stay on this thread for a single chunk.
+
+    Each worker thread opens its own database connection, and a connection
+    costs ~560 ms. Handing one chunk to a fresh thread throws away the caller's
+    already-warm connection to pay for a new one.
+    """
+    if not chunks:
+        return []
+    if len(chunks) == 1 or jobs <= 1:
+        return [work(chunk) for chunk in chunks]
+    with cf.ThreadPoolExecutor(min(jobs, len(chunks))) as pool:
+        return list(pool.map(work, chunks))
+
+
+def rollout_message_counts(
+    db: HorizonDatabase, rollout_ids: list[str], jobs: int = 12
+) -> dict[str, tuple[int, int]]:
+    """Assistant turns and tool calls per rollout, keyed by rollout id.
+
+    This used to be a LEFT JOIN inside the rollout query. The planner cannot
+    push a 156-million-row, 176 GB `messages` table through that join by index,
+    so it hash-joined the whole table and the statement hit the 120 s timeout
+    once the sheet passed roughly a hundred tasks -- the run did not get slower,
+    it FAILED. Asking for the rollout ids first and then probing `messages` by
+    those ids uses idx_messages_rollout_id_role and returns in seconds.
+
+    `json_typeof`/`json_array_length` replace `jsonb_typeof((...)::jsonb)`:
+    `content_json` is already `json`, so the cast was re-parsing and
+    normalising every assistant message only to read one array's length.
+    Verified to return identical counts.
+    """
+    if not rollout_ids:
+        return {}
+    chunks = balanced_chunks(sorted(set(rollout_ids)), jobs, MESSAGE_COUNT_CHUNK)
+
+    def one(chunk: list[str]) -> list[dict[str, str]]:
+        ids = ",".join(f"'{value}'::uuid" for value in chunk)
+        return db.csv(
+            f"""
+            SELECT m.rollout_id::text AS rollout_id,
+                   count(*) FILTER (WHERE m.role='assistant') AS assistant_turns,
+                   coalesce(sum(
+                     CASE WHEN m.role='assistant'
+                           AND json_typeof(m.content_json->'tool_calls')='array'
+                          THEN json_array_length(m.content_json->'tool_calls')
+                          ELSE 0 END
+                   ), 0) AS tool_calls
+            FROM messages m
+            WHERE m.rollout_id IN ({ids})
+            GROUP BY m.rollout_id
+            """
+        )
+
+    results = map_chunks(one, chunks, jobs)
+    counts: dict[str, tuple[int, int]] = {}
+    for rows in results:
+        for row in rows:
+            counts[row["rollout_id"]] = (
+                int(row["assistant_turns"] or 0), int(row["tool_calls"] or 0))
+    return counts
+
+
+def load_rollouts(db: HorizonDatabase, task_ids: list[str],
+                  jobs: int = 12) -> dict[str, dict[str, Any]]:
     ids = sql_ids(task_ids)
     rows = db.csv(
         f"""
@@ -658,27 +919,21 @@ def load_rollouts(db: HorizonDatabase, task_ids: list[str]) -> dict[str, dict[st
                e.model,
                e.status::text AS evaluation_status,
                r.extracted_score::text AS extracted_score,
-               r.created_at::text AS created_at,
-               count(*) FILTER (WHERE m.role='assistant') AS assistant_turns,
-               coalesce(sum(
-                 CASE WHEN m.role='assistant'
-                       AND jsonb_typeof((m.content_json::jsonb)->'tool_calls')='array'
-                      THEN jsonb_array_length((m.content_json::jsonb)->'tool_calls')
-                      ELSE 0 END
-               ), 0) AS tool_calls
+               r.created_at::text AS created_at
         FROM rollouts r
         JOIN evaluations e ON e.id = r.evaluation_id
-        LEFT JOIN messages m ON m.rollout_id = r.id
-        WHERE r.local_task_id ~ '^[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}$'
+        WHERE r.local_task_id ~ '{UUID_TEXT_GUARD}'
           AND r.local_task_id::uuid IN ({ids}) AND {MODEL_FILTER_SQL}
-        GROUP BY r.local_task_id, r.id, e.model, e.status,
-                 r.extracted_score, r.created_at
         """
     )
+    counts = rollout_message_counts(db, [row["rollout_id"] for row in rows], jobs)
     grouped: dict[str, list[dict[str, Any]]] = {task_id: [] for task_id in task_ids}
     for row in rows:
-        row["assistant_turns"] = int(row["assistant_turns"] or 0)
-        row["tool_calls"] = int(row["tool_calls"] or 0)
+        # A rollout with no messages kept its row under the old LEFT JOIN, with
+        # both counts at zero. Missing from `counts` means exactly that.
+        turns, calls = counts.get(row["rollout_id"], (0, 0))
+        row["assistant_turns"] = turns
+        row["tool_calls"] = calls
         grouped[row["task_id"]].append(row)
 
     result: dict[str, dict[str, Any]] = {}
@@ -745,23 +1000,7 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")[:80] or "task"
 
 
-def export_messages(
-    db: HorizonDatabase,
-    rollout_id: str,
-    task_dir: Path,
-) -> None:
-    rollout_id = str(uuid.UUID(rollout_id))
-    rows = db.csv(
-        f"""
-        SELECT sequence_number::text AS sequence_number,
-               role,
-               coalesce(content, '') AS content,
-               coalesce(content_json::text, '') AS content_json
-        FROM messages
-        WHERE rollout_id='{rollout_id}'::uuid
-        ORDER BY sequence_number
-        """
-    )
+def write_trajectory(rollout_id: str, rows: list[dict[str, str]], task_dir: Path) -> None:
     instruction = next(
         (row["content"] for row in rows if row["role"] == "user" and row["content"].strip()),
         None,
@@ -791,6 +1030,58 @@ def export_messages(
     (task_dir / "trajectory-001.jsonl").write_text(
         "\n".join(records) + "\n", encoding="utf-8"
     )
+
+
+def export_messages(
+    db: HorizonDatabase,
+    rollout_id: str,
+    task_dir: Path,
+) -> None:
+    export_message_batches(db, [(rollout_id, task_dir)], jobs=1)
+
+
+def export_message_batches(
+    db: HorizonDatabase,
+    pairs: list[tuple[str, Path]],
+    jobs: int = 12,
+) -> None:
+    """Export several rollouts per query instead of one query per rollout.
+
+    A trajectory is ~0.5 MB and 60-200 messages, so a dozen fit in one round
+    trip comfortably. Measured at 0.80 s per rollout one at a time versus
+    0.25 s inside a batch of twenty -- the difference is the connection and
+    round trip, not the rows.
+    """
+    # A list per rollout, not a single path: two rows can legitimately share a
+    # representative rollout, and keying a plain dict on the rollout id would
+    # silently export only the last of them.
+    targets: dict[str, list[Path]] = {}
+    for rollout_id, task_dir in pairs:
+        targets.setdefault(str(uuid.UUID(rollout_id)), []).append(task_dir)
+    chunks = balanced_chunks(sorted(targets), jobs, MESSAGE_EXPORT_CHUNK)
+
+    def one(chunk: list[str]) -> None:
+        ids = ",".join(f"'{value}'::uuid" for value in chunk)
+        rows = db.csv(
+            f"""
+            SELECT rollout_id::text AS rollout_id,
+                   sequence_number::text AS sequence_number,
+                   role,
+                   coalesce(content, '') AS content,
+                   coalesce(content_json::text, '') AS content_json
+            FROM messages
+            WHERE rollout_id IN ({ids})
+            ORDER BY rollout_id, sequence_number
+            """
+        )
+        by_rollout: dict[str, list[dict[str, str]]] = {value: [] for value in chunk}
+        for row in rows:
+            by_rollout[row["rollout_id"]].append(row)
+        for rollout_id, rollout_rows in by_rollout.items():
+            for task_dir in targets[rollout_id]:
+                write_trajectory(rollout_id, rollout_rows, task_dir)
+
+    map_chunks(one, chunks, jobs)
 
 
 def prepare_worker_key() -> tuple[Path, bool]:
@@ -1001,6 +1292,55 @@ def fit_for_pilot(item: dict[str, Any]) -> str:
     )
 
 
+# The R/P labels are the run's dominant cost -- one LLM call per 40 actions,
+# 69 chunks for 11 tasks -- and they are a deterministic function of ONE
+# rollout's trajectory. Keyed on rollout id, a re-run after adding five tasks
+# labels five tasks. The cache stores the finalized annotation, not the derived
+# metrics, so rp_metrics() and the R/P write patterns still re-evaluate from
+# source on every run: a code change takes effect, a labelling call does not
+# get repeated.
+DEFAULT_RP_CACHE = Path.home() / ".cache" / "pilot-analysis" / "rp"
+
+
+def rp_cache_path(cache_dir: Path, rollout_id: str) -> Path:
+    return cache_dir / f"{str(uuid.UUID(rollout_id))}.json"
+
+
+def seed_rp_cache_from_runs(runs_root: Path, cache_dir: Path) -> int:
+    """Adopt annotations left behind by earlier --keep-run-files runs.
+
+    A run directory names its packets by task, not by rollout, so the rollout id
+    is read back out of the exported trajectory itself rather than inferred from
+    the directory name -- two tasks can share a name, and a task can change
+    which rollout is representative between runs.
+    """
+    if not runs_root.is_dir():
+        return 0
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    adopted = 0
+    for run_dir in sorted(runs_root.iterdir()):
+        tasks = run_dir / "tasks"
+        outputs = run_dir / "outputs"
+        if not tasks.is_dir() or not outputs.is_dir():
+            continue
+        for task_dir in sorted(tasks.iterdir()):
+            trajectory = task_dir / "trajectory-001.jsonl"
+            annotated = outputs / task_dir.name / "annotated_trajectories.json"
+            if not trajectory.is_file() or not annotated.is_file():
+                continue
+            try:
+                first = json.loads(trajectory.read_text(encoding="utf-8").split("\n", 1)[0])
+                rollout_id = str(uuid.UUID(first["rollout_id"]))
+            except (ValueError, KeyError, json.JSONDecodeError):
+                continue
+            target = rp_cache_path(cache_dir, rollout_id)
+            if target.exists():
+                continue
+            shutil.copyfile(annotated, target)
+            adopted += 1
+    return adopted
+
+
 def analyse_tasks(
     db: HorizonDatabase,
     task_ids: list[str],
@@ -1009,13 +1349,14 @@ def analyse_tasks(
     tool_root: Path,
     jobs: int = 12,
     label_concurrency: int = 16,
+    rp_cache: Path | None = None,
 ) -> list[dict[str, Any]]:
-    metadata = load_task_metadata(db, task_ids)
-    rollout_data = load_rollouts(db, task_ids)
+    metadata = load_task_metadata(db, task_ids, jobs=jobs)
+    rollout_data = load_rollouts(db, task_ids, jobs=jobs)
     # Directory names are assigned serially -- collision handling depends on what
     # has been claimed so far -- but the exports themselves are independent.
     names: dict[str, str] = {}
-    exports: list[tuple[str, str]] = []
+    rollout_ids: dict[str, str] = {}
     for task_id in task_ids:
         representative = rollout_data[task_id]["representative"]
         if not representative:
@@ -1024,20 +1365,43 @@ def analyse_tasks(
         if dirname in names.values():
             dirname = f"{dirname}__{task_id[:8]}"
         names[task_id] = dirname
-        exports.append((representative["rollout_id"], dirname))
+        rollout_ids[dirname] = representative["rollout_id"]
 
-    if exports:
-        print(f"exporting {len(exports)} trajectories with {jobs} workers ...",
+    if rp_cache is not None:
+        rp_cache.mkdir(parents=True, exist_ok=True)
+    cached: dict[str, Path] = {}
+    if rp_cache is not None:
+        for dirname, rollout_id in rollout_ids.items():
+            path = rp_cache_path(rp_cache, rollout_id)
+            if path.is_file():
+                cached[dirname] = path
+    pending = [name for name in names.values() if name not in cached]
+    if cached:
+        print(f"reusing {len(cached)} cached R/P annotations; {len(pending)} to label",
               file=sys.stderr, flush=True)
-        with cf.ThreadPoolExecutor(jobs) as pool:
-            list(pool.map(
-                lambda pair: export_messages(db, pair[0], run_dir / "tasks" / pair[1]),
-                exports))
 
-    paths = prepare_and_label(
-        list(names.values()), run_dir, pipeline_root, tool_root,
-        jobs=jobs, label_concurrency=label_concurrency,
-    )
+    if pending:
+        print(f"exporting {len(pending)} trajectories with {jobs} workers ...",
+              file=sys.stderr, flush=True)
+        export_message_batches(
+            db,
+            [(rollout_ids[name], run_dir / "tasks" / name) for name in pending],
+            jobs=jobs,
+        )
+
+    paths = dict(cached)
+    if pending:
+        paths.update(prepare_and_label(
+            pending, run_dir, pipeline_root, tool_root,
+            jobs=jobs, label_concurrency=label_concurrency,
+        ))
+        if rp_cache is not None:
+            for name in pending:
+                try:
+                    shutil.copyfile(paths[name], rp_cache_path(rp_cache, rollout_ids[name]))
+                except OSError as exc:  # a cache miss is never a run failure
+                    print(f"could not cache R/P annotation for {name}: {exc}",
+                          file=sys.stderr, flush=True)
     result = []
     for task_id in task_ids:
         rp_data = (
@@ -1524,9 +1888,17 @@ def main() -> None:
     if not task_ids:
         raise SystemExit("Provide at least one task ID, task URL, or --task-file")
 
+    rp_cache = None if args.no_rp_cache else args.rp_cache.expanduser()
+    if args.seed_rp_cache and rp_cache is not None:
+        adopted = seed_rp_cache_from_runs(
+            Path(__file__).resolve().parent / "runs", rp_cache)
+        print(f"seeded {adopted} R/P annotations into {rp_cache}",
+              file=sys.stderr, flush=True)
+
     stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
     run_dir = args.run_dir or Path(__file__).resolve().parent / "runs" / stamp
     run_dir.mkdir(parents=True, exist_ok=False)
+    started = time.perf_counter()
     try:
         with HorizonDatabase(args.port) as db:
             new_rows = analyse_tasks(
@@ -1537,6 +1909,7 @@ def main() -> None:
                 args.tool_root.expanduser(),
                 jobs=args.jobs,
                 label_concurrency=args.label_concurrency,
+                rp_cache=rp_cache,
             )
         enrich: dict[str, dict[str, Any]] = {}
         if getattr(args, "enrich", None) and args.enrich.is_file():
@@ -1555,6 +1928,8 @@ def main() -> None:
         print(f"Run files kept for debugging: {run_dir}", file=sys.stderr)
         raise
     else:
+        print(f"analysed {len(task_ids)} tasks in {time.perf_counter() - started:.1f} s",
+              file=sys.stderr, flush=True)
         if not args.keep_run_files:
             shutil.rmtree(run_dir)
 

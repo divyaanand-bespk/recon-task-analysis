@@ -2,6 +2,7 @@ import importlib.util
 from html.parser import HTMLParser
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
@@ -195,13 +196,82 @@ class GeneratorTests(unittest.TestCase):
             parser = FrameParser()
             outer = output.read_text(encoding="utf-8")
             parser.feed(outer)
-            self.assertIn('sandbox="allow-scripts"', outer)
+            # The sandbox deliberately carries the popup tokens: without them the
+            # frame blocked every Horizon task link in the report. Assert the
+            # tokens rather than the exact attribute string, so widening it again
+            # for a further reason does not fail a test that is really about
+            # allow-same-origin -- which, together with allow-scripts, would let
+            # the frame reach out of the sandbox and must never appear here.
+            sandbox = re.search(r'<iframe[^>]*\ssandbox="([^"]*)"', outer)
+            self.assertIsNotNone(sandbox)
+            tokens = set(sandbox.group(1).split())
+            self.assertIn("allow-scripts", tokens)
+            self.assertIn("allow-popups", tokens)
+            self.assertIn("allow-popups-to-escape-sandbox", tokens)
+            self.assertNotIn("allow-same-origin", tokens)
             self.assertIn("default-src 'none'", outer)
             self.assertIsNotNone(parser.srcdoc)
             self.assertNotIn("<script src=", parser.srcdoc)
             data = json.loads(output.with_suffix(".json").read_text())
             self.assertEqual(data["tasks"], [sample_row()])
             self.assertEqual(GENERATOR.load_existing_rows(output), [sample_row()])
+
+    def test_csv_keeps_carriage_returns_inside_quoted_fields(self):
+        """The parse used to drop 1.8% of every exported trajectory.
+
+        Terminal output is full of CRLF. Splitting the COPY stream with
+        str.splitlines() threw the terminator away, so a newline inside a quoted
+        field came back as a bare \n and the \r was gone -- silently, with the
+        right number of rows, which is why it survived so long. Measured against
+        the server: 20 of 20 rollouts corrupted, 80,508 of 4,498,714 characters
+        lost. Reading through io.StringIO(text, newline="") is exact.
+        """
+        content = "line one\r\nline two\r\nline three"
+        payload = 'seq,content\n1,"%s"\n' % content
+        db = GENERATOR.HorizonDatabase(1)
+        db._query = lambda _sql: payload
+        rows = db.csv("SELECT 1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["content"], content)
+
+    def test_balanced_chunks_covers_everything_and_respects_the_cap(self):
+        values = list(range(43))
+        chunks = GENERATOR.balanced_chunks(values, jobs=12, cap=24)
+        self.assertEqual([v for chunk in chunks for v in chunk], values)
+        self.assertTrue(all(len(chunk) <= 24 for chunk in chunks))
+        # The invariant that matters: no worker is handed more than its share,
+        # so batching cannot starve the pool the way a fixed size did.
+        self.assertLessEqual(max(len(chunk) for chunk in chunks), -(-43 // 12))
+        # 24 rollouts over 12 workers is 12 chunks, not the 2 a fixed size of 12
+        # produced -- that regression is what made batching slower than not.
+        self.assertEqual(len(GENERATOR.balanced_chunks(list(range(24)), 12, 24)), 12)
+        # The cap is a statement-timeout ceiling and is never exceeded.
+        wide = GENERATOR.balanced_chunks(list(range(1000)), jobs=2, cap=24)
+        self.assertTrue(all(len(chunk) <= 24 for chunk in wide))
+        self.assertEqual(GENERATOR.balanced_chunks([], jobs=12, cap=24), [])
+
+    def test_rp_cache_is_keyed_on_the_rollout_not_the_task_name(self):
+        rollout = "2f950392-6bd1-40fc-8ca3-73bc5d4441fe"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "runs" / "stamp"
+            task = run / "tasks" / "some-task"
+            task.mkdir(parents=True)
+            (task / "trajectory-001.jsonl").write_text(
+                json.dumps({"rollout_id": rollout, "sequence_number": 1,
+                            "role": "user", "content": "hi"}) + "\n",
+                encoding="utf-8")
+            output = run / "outputs" / "some-task"
+            output.mkdir(parents=True)
+            (output / "annotated_trajectories.json").write_text(
+                json.dumps({"trajectories": [{"actions": []}]}), encoding="utf-8")
+            cache = root / "cache"
+            self.assertEqual(
+                GENERATOR.seed_rp_cache_from_runs(root / "runs", cache), 1)
+            self.assertTrue(GENERATOR.rp_cache_path(cache, rollout).is_file())
+            # Idempotent: a second pass adopts nothing and overwrites nothing.
+            self.assertEqual(
+                GENERATOR.seed_rp_cache_from_runs(root / "runs", cache), 0)
 
 
 if __name__ == "__main__":
