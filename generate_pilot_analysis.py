@@ -1542,7 +1542,7 @@ def js_json(value: Any) -> str:
 
 def make_inner_html(rows: list[dict[str, Any]], updated: str) -> str:
     data = js_json(rows)
-    return f"""<!doctype html>
+    return rf"""<!doctype html>
 <html lang="en-GB">
 <head>
 <meta charset="utf-8">
