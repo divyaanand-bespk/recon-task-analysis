@@ -82,10 +82,27 @@ $PY golden_app.py    /tmp/pilot.json -o /tmp/golden-set.html
 ## The caches are local, and that matters for handover
 
 `~/.cache/pilot-analysis/` holds two caches: `enrich/` (per task+version) and
-`rp/` (research-and-planning labels, ~29MB). **They do not travel with the repo.**
-A teammate's first run is a cold run: every task re-enriched and every
-trajectory re-labelled, which costs real API spend. Warn them before they start.
-Neither cache is required for correctness — both only avoid re-paying.
+`rp/` (research-and-planning labels, ~29MB). **Neither travels with this repo**,
+so a fresh clone pays a cold start. Neither is required for correctness — they
+only avoid re-paying. `/tmp/pilot_enrich.json` does not travel either; it is
+easy to assume that sidecar counts as a cache, and it does not.
+
+Measured on the 53-group / 99-task-id sheet:
+
+| step | cold | warm | bills you |
+|---|---|---|---|
+| enrichment | 99 API fetches, ~50s at `--workers 16` | cached | no |
+| database pass | 13s | 3s | no |
+| R/P labelling | ~250 chunks over 59 rollouts, **~$11** | cached | **yes** |
+
+The whole 13s-vs-3s database difference is exporting 59 trajectories (36MB);
+`load_task_metadata` and `load_rollouts` cost the same either way because they
+touch neither cache. Only 59 of the 99 tasks have a representative rollout, so
+only those are ever exported or labelled.
+
+**R/P labelling is the only step that costs money.** Re-runs are near-free —
+labels are cached per rollout id, so adding five tasks to the sheet costs five
+tasks, not 99.
 
 ## Reading the sheet
 
