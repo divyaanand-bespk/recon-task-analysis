@@ -192,7 +192,9 @@ def build(data: dict, gated: bool) -> str:
         "owner": r.get("responsible"), "lang": axis(r, "lang_key"),
         "shape": r.get("shape"), "repo": axis(r, "repo_key").replace("github.com/", ""),
         "rollouts": r.get("rollouts_n"), "turns": r.get("turns_median"),
-        "rp": r.get("leading_rp"),
+        "rp_lead": r.get("leading_rp"),
+        "rp_done": r.get("rp_complete_step"),
+        "rp_total": r.get("total_rp"),
         "pass6": (f'{r.get("pass6")}/{r.get("pass6_denominator")}'
                   if r.get("pass6_denominator") else DASH),
         "fresh": r.get("_fresh_axes") or [], "spent": r.get("_spent_axes") or [],
@@ -208,7 +210,10 @@ def build(data: dict, gated: bool) -> str:
                 f'<td class="axes">{chips(t)}</td>'
                 f'<td class="n">{esc(t["rollouts"] if t["rollouts"] is not None else DASH)}</td>'
                 f'<td class="n">{esc(t["turns"] if t["turns"] is not None else DASH)}</td>'
-                f'<td class="n">{esc(t["rp"])}</td><td class="n">{esc(t["pass6"])}</td></tr>')
+                f'<td class="n">{esc(t["rp_total"])}</td>'
+                f'<td class="n">{esc(t["rp_lead"])}</td>'
+                f'<td class="n">{esc(t["rp_done"] if t["rp_done"] is not None else DASH)}</td>'
+                f'<td class="n">{esc(t["pass6"])}</td></tr>')
 
     golden = "".join(row(t) for t in tasks[:TARGET])
     n_golden = min(TARGET, len(tasks))
@@ -283,11 +288,17 @@ def build(data: dict, gated: bool) -> str:
   <h2>The {n_golden} golden tasks</h2>
   <div class="prose"><p>In pick order. Every task links to its Horizon record. The
   <span class="ax new">Lang</span> chips mark an axis this task opened;
-  <span class="ax rep">Repo&middot;2</span> means it was the second task on that value.</p></div>
+  <span class="ax rep">Repo&middot;2</span> means it was the second task on that value.
+  <b>R/P total</b> is all research-and-planning actions; <b>R/P lead</b> counts only the
+  unbroken run at the very start, so a task that researched later shows a low lead and a
+  high total; <b>R/P done</b> is the step the artifact was last written.</p></div>
   <div class="scroll tall"><table>
     <thead><tr><th class="n">#</th><th>Task</th><th>Lang</th><th>Shape</th><th>Repository</th>
       <th>Opened</th><th class="n">Rollouts</th><th class="n">Turns</th>
-      <th class="n">R/P</th><th class="n">pass6</th></tr></thead>
+      <th class="n" title="research and planning actions in total">R/P total</th>
+      <th class="n" title="unbroken run of research/planning actions at the very start">R/P lead</th>
+      <th class="n" title="step at which the research and planning artifact was last written">R/P done</th>
+      <th class="n">pass6</th></tr></thead>
     <tbody>{golden}</tbody>
   </table></div>
 </section>
@@ -298,7 +309,10 @@ def build(data: dict, gated: bool) -> str:
   <div class="scroll tall"><table>
     <thead><tr><th class="n">#</th><th>Task</th><th>Lang</th><th>Shape</th><th>Repository</th>
       <th>Opened</th><th class="n">Rollouts</th><th class="n">Turns</th>
-      <th class="n">R/P</th><th class="n">pass6</th></tr></thead>
+      <th class="n" title="research and planning actions in total">R/P total</th>
+      <th class="n" title="unbroken run of research/planning actions at the very start">R/P lead</th>
+      <th class="n" title="step at which the research and planning artifact was last written">R/P done</th>
+      <th class="n">pass6</th></tr></thead>
     <tbody>{trs}</tbody>
   </table></div>
 </section>

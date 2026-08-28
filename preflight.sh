@@ -12,12 +12,33 @@ echo "Preflight"
 # --- interpreter: python >= 3.11 WITH the horizon package -------------------
 # The macOS system python3 is 3.9 and has no tomllib, so diversity_enrich.py
 # dies on its import line. Discover rather than assume a path.
+# TWO SHELL DIFFERENCES BITE HERE, and this file is SOURCED into whichever shell
+# the user has -- zsh is the macOS default, bash is common, so it must work in both.
+#   1. zsh ABORTS an entire `for` list on an unmatched glob ("no matches found"),
+#      so the loop never runs and $PY is silently left empty. `find` does its own
+#      matching and never hands an unmatched pattern to the shell.
+#   2. zsh does NOT word-split an unquoted variable, so `for c in $candidates`
+#      iterates ONCE over the whole string. Reading newline-delimited lines
+#      behaves identically in sh, bash and zsh.
+# A venv's `python` is also a symlink, so `-type f` would skip it.
+_cands=$(
+  for _p in python3.13 python3.12 python3.11; do command -v "$_p" 2>/dev/null; done
+  _root=$(git rev-parse --show-toplevel 2>/dev/null) && printf '%s\n' "$_root/.venv/bin/python"
+  find "$HOME" -maxdepth 6 -path '*/.venv/bin/python' 2>/dev/null | head -40
+)
 PY=""
-for c in $(command -v python3.13 python3.12 python3.11 2>/dev/null) \
-         "$(git rev-parse --show-toplevel 2>/dev/null)/.venv/bin/python" \
-         "$HOME"/*/horizon/.venv/bin/python "$HOME"/*/*/horizon/.venv/bin/python; do
-  [ -x "$c" ] && "$c" -c "import horizon, tomllib" 2>/dev/null && { PY="$c"; break; }
-done
+while IFS= read -r c; do
+  [ -n "$c" ] || continue
+  # test the CAPABILITY, not just the import: version_materiality.py needs
+  # download_urls(version=...), which older horizon clients do not have.
+  if [ -x "$c" ] && "$c" -c "import tomllib, inspect
+from horizon.client import HorizonClient
+assert 'version' in inspect.signature(HorizonClient(api_key='x').tasks.download_urls).parameters" 2>/dev/null
+  then PY="$c"; break; fi
+done <<EOF
+$_cands
+EOF
+unset _cands
 if [ -n "$PY" ]; then say "ok" "python  $PY ($("$PY" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))'))"
 else fail "python >= 3.11 with the 'horizon' package" \
           "install the horizon client into a venv, e.g. 'uv pip install horizon' in your horizon checkout"; fi
@@ -47,10 +68,17 @@ fi
 
 # --- the API key, needed twice under two names ------------------------------
 if [ -z "${HORIZON_API_KEY:-}" ]; then
-  for env in .env ../.env "$HOME"/*/voyager-diagnosis-pipeline/.env; do
-    [ -f "$env" ] && grep -q '^HORIZON_API_KEY=.' "$env" 2>/dev/null && {
-      set -a; . "$env"; set +a; say "ok" "api key from $env"; break; }
-  done
+  # same two shell constraints as above
+  _envs=$(printf '%s\n' .env ../.env; find "$HOME" -maxdepth 4 -name .env 2>/dev/null | head -10)
+  while IFS= read -r env; do
+    [ -n "$env" ] || continue
+    if [ -f "$env" ] && grep -q '^HORIZON_API_KEY=.' "$env" 2>/dev/null; then
+      set -a; . "$env"; set +a; say "ok" "api key from $env"; break
+    fi
+  done <<EOF
+$_envs
+EOF
+  unset _envs
 fi
 if [ -n "${HORIZON_API_KEY:-}" ]; then
   say "ok" "api key set (${#HORIZON_API_KEY} chars)"
