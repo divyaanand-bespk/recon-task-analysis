@@ -51,47 +51,41 @@ def axis_value(row: dict, field: str) -> str:
 
 
 
+def task_distance(a: dict, b: dict) -> int:
+    """How different two tasks are: the number of axes on which they disagree.
+
+    0 means identical on language, shape AND repository; 3 means they share
+    nothing. Every axis counts the same, deliberately -- ranking them is what
+    made an earlier version cycle one axis while never leaving another.
+    """
+    return sum(1 for field, _ in AXES if axis_value(a, field) != axis_value(b, field))
+
+
 def diverse_order(rows: list[dict]) -> tuple[list[dict], dict]:
-    """Order fit-for-pilot tasks so each pick differs on AS MANY AXES AS POSSIBLE.
+    """Order tasks by FARTHEST-FIRST TRAVERSAL: each pick is the task most
+    different from everything already picked.
 
-    WHY NOT LEXICOGRAPHIC. The previous key ranked the axes -- language, then
-    shape, then repository -- so language was absolutely dominant: a task that
-    opened an unused language won even when it repeated both the shape and the
-    repository of the pick before it. Given a thousand Diagnosis tasks in one
-    Python repository spread over many languages, that key would cycle languages
-    forever and never leave the repository or the shape. Repositories are also
-    multi-language, so language freshness does not imply repository freshness.
+    Formally: maximise the MINIMUM distance to the selected set (Gonzalez's
+    greedy for k-center, a standard max-min dispersion heuristic). Distance to
+    the whole set, not to the last pick -- measuring only against the previous
+    one has no memory, so pick 3 can land in the same corner as pick 1: from a
+    python/Diagnosis task the farthest is go/DeepSWE, and from there the
+    farthest is python/Diagnosis again. Different task, same corner.
 
-    WHAT THIS DOES INSTEAD, at every step:
+    Ties are common, because with three axes the distance is only ever 0-3. They
+    break on BALANCE: total similarity to the selected set, which is the summed
+    per-axis usage of this task's values. That spreads picks evenly across the
+    values of every axis at once instead of hammering one. Then quality (most
+    rollouts, then highest median turns), then the row's original position.
 
-      1. BREADTH   maximise how many axes the pick leaves UNUSED-so-far.
-                   A task fresh on all three beats one fresh on two, which beats
-                   one fresh on one. No axis outranks another.
-      2. FORGONE   when nothing is fully fresh, minimise what the repeat COSTS:
-                   for each axis the pick repeats, how many values on that axis
-                   are still UNUSED and still reachable in the remaining pool.
-                   Repeating a repository while ten sit unused forgoes ten
-                   chances; repeating one of two languages while one sits unused
-                   forgoes one. An exhausted axis scores zero, so a forced
-                   repeat is free -- there was nothing to give up.
-      3. SPREAD    among equally costly repeats, prefer the LEAST-used value, so
-                   picks fan out across an axis instead of piling onto one value.
-      4. QUALITY   most eligible rollouts, then highest median turns.
-      5. RANK      exact ties only.
+    The seed is the most unusual task in the pool -- the one whose language,
+    shape and repository are collectively rarest -- so the traversal starts at
+    an extreme rather than in the middle.
 
-    An earlier version scored term 2 as relative over-use against each axis's
-    "fair share", `used / max(1, picks / distinct)`. That was blind in exactly
-    the region that matters. With 3 languages and 12 repositories, a candidate
-    opening the last free language while REUSING a repository and one opening a
-    fresh repository while reusing a language both scored 2.000 -- the clamp
-    pinned both denominators at 1.0 for the first several picks, so nothing in
-    the key knew one axis had ten free values left and the other had one. The
-    tie fell through to input order, and the list burned repositories it could
-    not afford inside a 50-task cut.
-
-    Diversity is therefore spent only when the pool genuinely offers nothing
-    fresher, and it is spent on whichever axis is least costly at that moment
-    rather than on a fixed pecking order.
+    Everything here treats the three axes symmetrically. Two earlier keys did
+    not, and both failed in ways only a constructed pool exposed: ranking the
+    axes let language dominate absolutely, and scoring a repeat by "relative
+    over-use" was blind in the early picks, where it matters most.
     """
     pool = [dict(r) for r in rows if r.get("fit") == "YES"]
     for rank, row in enumerate(pool):
@@ -101,82 +95,82 @@ def diverse_order(rows: list[dict]) -> tuple[list[dict], dict]:
     used = {field: collections.Counter() for field, _ in AXES}
     traded_total = [0]
     ordered: list[dict] = []
+    if not pool:
+        return ordered, _diagnostics(ordered, distinct, total, traded_total[0])
 
-    def key(r: dict, unused_now: dict[str, int]):
-        fresh = 0
-        forgone = 0
-        spread = 0
-        for field, _ in AXES:
-            value = axis_value(r, field)
-            count = used[field][value]
-            if count == 0:
-                fresh += 1
-                continue
-            # THE COST OF A REPEAT IS WHAT IT GIVES UP. Count the values on this
-            # axis that are still unused AND still present in the pool: those are
-            # the chances this repeat forgoes. An exhausted axis gives up
-            # nothing, so a forced repeat costs nothing and never outranks a
-            # genuine choice.
-            forgone += unused_now[field]
-            spread += count
-        return (-fresh, forgone, spread,
-                -int(r.get("rollouts_n") or 0),
+    def quality(r):
+        return (-int(r.get("rollouts_n") or 0),
                 -int(r.get("turns_median") or 0),
                 r["_rank"])
 
-    while pool:
-        # how many values on each axis are still unused AND still obtainable.
-        # Recomputed per step: a value stops counting once the last row carrying
-        # it has been taken, so "forgone" only ever counts real, reachable options.
-        unused_now = {
-            field: len({axis_value(r, field) for r in pool
-                        if used[field][axis_value(r, field)] == 0})
-            for field, _ in AXES
-        }
-        pick = min(pool, key=lambda r: key(r, unused_now))
-        pick["_fresh_axes"] = []
-        pick["_spent_axes"] = []
+    # SEED: the rarest combination in the pool, so we begin at an extreme.
+    frequency = {field: collections.Counter(axis_value(r, field) for r in pool)
+                 for field, _ in AXES}
+    first = min(pool, key=lambda r: (sum(frequency[f][axis_value(r, f)] for f, _ in AXES),)
+                + quality(r))
+    remaining = [r for r in pool if r is not first]
+    nearest = {id(r): task_distance(r, first) for r in remaining}
+    chosen = first
+
+    while True:
+        # annotate the pick against the axes consumed so far
+        chosen["_fresh_axes"], chosen["_spent_axes"] = [], []
         for field, label in AXES:
-            value = axis_value(pick, field)
+            value = axis_value(chosen, field)
             n = used[field][value] + 1
             if used[field][value] == 0:
-                pick["_fresh_axes"].append(label)
+                chosen["_fresh_axes"].append(label)
                 why = "fresh"
             else:
-                pick["_spent_axes"].append(f"{label} #{n}")
-                # TRADED vs FORCED. A repeat is only a choice if the pool still
-                # held an unused value on this axis. Under joint breadth a trade
-                # is deliberate: we gave up freshness HERE to gain more of it on
-                # the other axes. FORCED means the pool was exhausted -- nothing
-                # for the reader to fix.
+                chosen["_spent_axes"].append(f"{label} #{n}")
+                # TRADED means an unused value was still reachable; FORCED means
+                # the pool had nothing left. Only a trade reflects a decision.
                 why = ("traded" if any(used[field][axis_value(o, field)] == 0
-                                       for o in pool) else "forced")
+                                       for o in remaining) else "forced")
                 if why == "traded":
                     traded_total[0] += 1
-            pick[f"_{field}_why"] = why
-            pick[f"_{field}_n"] = n
+            chosen[f"_{field}_why"] = why
+            chosen[f"_{field}_n"] = n
             used[field][value] += 1
-        pick["_new_lang"] = "Language" in pick["_fresh_axes"]
-        pick["_new_shape"] = "Shape" in pick["_fresh_axes"]
-        pick["_new_repo"] = "Repository" in pick["_fresh_axes"]
-        pick["_lang_n"] = used["lang_key"][axis_value(pick, "lang_key")]
-        pick["_shape_n"] = used["shape"][axis_value(pick, "shape")]
-        pick["_repo_n"] = used["repo_key"][axis_value(pick, "repo_key")]
-        pick["_repeat_lang"] = not pick["_new_lang"]
-        pick["_repeat_repo"] = not pick["_new_repo"]
-        pick["_fresh"] = len(pick["_fresh_axes"]) == len(AXES)
-        pick["_breadth"] = len(pick["_fresh_axes"])
-        ordered.append(pick)
-        pool = [r for r in pool if r.get("task_id") != pick.get("task_id")]
+        chosen["_fresh"] = len(chosen["_fresh_axes"]) == len(AXES)
+        chosen["_breadth"] = len(chosen["_fresh_axes"])
+        chosen["_new_lang"] = "Language" in chosen["_fresh_axes"]
+        chosen["_new_shape"] = "Shape" in chosen["_fresh_axes"]
+        chosen["_new_repo"] = "Repository" in chosen["_fresh_axes"]
+        chosen["_repeat_lang"] = not chosen["_new_lang"]
+        chosen["_repeat_repo"] = not chosen["_new_repo"]
+        chosen["_lang_n"] = used["lang_key"][axis_value(chosen, "lang_key")]
+        chosen["_shape_n"] = used["shape"][axis_value(chosen, "shape")]
+        chosen["_repo_n"] = used["repo_key"][axis_value(chosen, "repo_key")]
+        chosen["_min_distance"] = chosen.get("_min_distance", len(AXES))
+        ordered.append(chosen)
+        if not remaining:
+            break
 
+        def key(r):
+            similarity = sum(used[f][axis_value(r, f)] for f, _ in AXES)
+            return (-nearest[id(r)], similarity) + quality(r)
+
+        chosen = min(remaining, key=key)
+        chosen["_min_distance"] = nearest[id(chosen)]
+        remaining = [r for r in remaining if r is not chosen]
+        for r in remaining:                       # keep nearest-to-set current
+            d = task_distance(r, chosen)
+            if d < nearest[id(r)]:
+                nearest[id(r)] = d
+
+    return ordered, _diagnostics(ordered, distinct, total, traded_total[0])
+
+
+def _diagnostics(ordered: list[dict], distinct: dict, total: int, traded: int) -> dict:
     axes_diag = []
     for field, label in AXES:
-        n = distinct[field]
+        n = distinct.get(field, 0)
         first_repeat = next((i + 1 for i, x in enumerate(ordered)
                              if label not in x["_fresh_axes"]), None)
         axes_diag.append({
             "field": field, "label": label, "distinct": n,
-            # the earliest a repeat COULD happen: once every value is used once
+            # the earliest a repeat COULD occur: once every value is used once
             "floor": min(n + 1, total) if n else 0,
             "first_repeat": first_repeat,
             "forced": sum(1 for x in ordered if x[f"_{field}_why"] == "forced"),
@@ -185,20 +179,17 @@ def diverse_order(rows: list[dict]) -> tuple[list[dict], dict]:
             "optimal": first_repeat is None or first_repeat >= min(n + 1, total),
             "degenerate": n <= 1,
         })
-    # LEADING STREAK, not a total. The reader wants to know how deep the list
-    # stays perfect before any axis has to repeat -- a count scattered through
-    # the tail would not answer that.
     streak = 0
     for x in ordered:
         if not x["_fresh"]:
             break
         streak += 1
     counts = collections.Counter(r.get("task_id") for r in ordered)
-    return ordered, {
+    return {
         "axes": axes_diag,
         "total": total,
         "duplicate_ids": sorted(t for t, c in counts.items() if c > 1 and t),
-        "traded_picks": traded_total[0],
+        "traded_picks": traded,
         "all_fresh_through": streak,
         "all_fresh_total": sum(1 for x in ordered if x["_fresh"]),
         "first_spent": next((a for a in axes_diag if a["first_repeat"]), None),

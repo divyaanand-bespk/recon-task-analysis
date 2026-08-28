@@ -169,25 +169,43 @@ produced a report whenever you present one.
 
 ## The selection strategy
 
-`diverse_order()` in `render_report.py` orders the fit pool. Five terms:
+`diverse_order()` in `render_report.py` orders the pool by **farthest-first
+traversal**: each pick is the task most different from everything already
+picked. This is Gonzalez's greedy for k-center, a standard max-min dispersion
+heuristic.
 
-1. **Breadth** — how many of language / shape / repository the pick leaves
-   unused so far. Maximised. **The three axes are NOT ranked against each other.**
-2. **Pressure** — summed relative over-use, each axis against its own fair share.
-3. Rollouts, 4. median turns, 5. original rank.
+- **Distance** between two tasks = the number of axes (language, shape,
+  repository) on which they disagree, 0 to 3. Every axis weighs the same.
+- **Each step** takes the task whose distance to its NEAREST already-picked task
+  is largest. Distance to the whole selected set, not to the last pick.
+- **Ties** — common, since distance is only ever 0-3 — break on BALANCE: the
+  summed per-axis usage of the task's values. Lower means its language, shape
+  and repository have been used less, so picks spread across every axis at once.
+- Then quality: most rollouts, then highest median turns. Then original position.
+- **The seed** is the rarest combination in the pool, so it starts at an extreme.
 
-An earlier version ranked the axes (language, then shape, then repository) and
-that was wrong: language became absolutely dominant, so a task opening a new
-language won even when it repeated both the shape and the repository. With many
-tasks in ONE repository across many languages — and repositories are
-multi-language — it would cycle languages forever and never leave that repo.
-On a stress pool it returned to the same repo at pick 8 with fresh repos still
-available; the current key cannot repeat before pick 22, the floor.
+**Running out of options is not failure.** When nothing distant remains the
+ordering does not stop — it takes the least similar task left. Repeats at the
+tail mean the pool ran out, and the list still reaches its target.
 
-`golden_app.py` keeps an INDEPENDENT copy of this key to explain each pick, and
-self-checks that replaying it reproduces the order. **If you change the key in
-one file you must change it in both**, then confirm the page does not say
-"local fallback" or "did not reproduce".
+Three earlier versions failed, each only visible on a constructed pool:
+
+1. **Ranking the axes** (language, then shape, then repository) made language
+   absolutely dominant: a task opening an unused language won even when it
+   repeated both the shape and the repository. With many tasks in ONE repository
+   across many languages it cycled languages and never left the repo.
+2. **Scoring a repeat by "relative over-use"** was blind exactly where it
+   mattered. With 3 languages and 12 repositories, taking the last free language
+   while REUSING a repository scored identically to taking a fresh repository
+   while reusing a language, because the fair-share denominator stayed clamped
+   through the early picks. The tie fell to input order.
+3. **Rewarding only freshness** stopped influencing anything once every value on
+   an axis had been used once, so the tail clumped.
+
+Measuring only against the PREVIOUS pick has the same class of flaw: it has no
+memory, so pick 3 can land in the same corner as pick 1 — from a
+python/Diagnosis task the farthest is go/DeepSWE, and from there the farthest is
+python/Diagnosis again. Different task, same corner.
 
 ## What the three reports are
 

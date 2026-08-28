@@ -31,9 +31,8 @@ HORIZON = "https://horizon.bespokelabs.ai/tasks/"
 AX = (("lang_key", "language"), ("shape", "shape"), ("repo_key", "repository"))
 
 TERMS = [
-    ("Breadth", "opens the most unused axes at once (3 &gt; 2 &gt; 1 &gt; 0)", "diversity"),
-    ("Forgone", "cheapest repeat &mdash; fewest still-unused values given up", "diversity"),
-    ("Spread", "among equal repeats, the least-used value", "diversity"),
+    ("Distance", "most different from everything already picked (3 &gt; 2 &gt; 1 &gt; 0)", "diversity"),
+    ("Balance", "among equally distant, the least-used values", "diversity"),
     ("Rollouts", "most eligible rollouts", "quality"),
     ("Turns", "highest median turns", "quality"),
     ("Rank", "existing rank (exact ties only)", "tiebreak"),
@@ -108,52 +107,41 @@ def norm_reason(text: str) -> str:
 
 # ------------------------------------------------------------------ selection
 
-def key_tuple(r, used, unused_now):
-    """The shipped six-term key, re-stated for explanation only.
+def key_tuple(r, used, nearest):
+    """The shipped key, re-stated for explanation only.
 
-    The axes are NOT ranked against each other. The first version put language
-    first, shape second, repository third, which made language absolutely
-    dominant: a task opening an unused language won even when it repeated both
-    the shape and the repository before it. Given many tasks in ONE repository
-    spread across many languages -- and repositories are multi-language -- that
-    key would cycle languages forever and never leave the repository.
+    FARTHEST-FIRST: term 1 is the distance from this task to the NEAREST task
+    already picked, maximised -- so each pick is the one most different from
+    everything chosen so far. Distance is the number of axes (language, shape,
+    repository) on which two tasks disagree, every axis weighted the same.
 
-    Term 1 counts how many axes the pick leaves untouched, so opening three
-    beats opening one regardless of WHICH. Term 2 prices what a repeat gives
-    up: the number of values on that axis still unused and still reachable in
-    the pool. Term 3 spreads picks across an axis rather than piling onto one
-    value.
+    Term 2 breaks the many ties -- with three axes the distance is only ever
+    0-3 -- on balance: total similarity to the selected set, which is the summed
+    per-axis usage of this task's values. Lower means its values have been used
+    less, so picks spread across every axis at once instead of piling onto one.
 
-    Term 2 replaced a "relative over-use" score that was blind where it counted.
-    With 3 languages and 12 repositories, a candidate taking the last free
-    language while REUSING a repository and one taking a fresh repository while
-    reusing a language scored identically, because the fair-share denominator
-    stayed clamped at 1.0 through the early picks. The tie fell to input order
-    and the list burned repositories it could not afford inside a 50-task cut.
+    When nothing distant is left the ordering does not stop; it takes the least
+    similar option remaining. Repeats at the tail are the pool running out, not
+    the algorithm giving up.
     """
-    fresh = 0
-    forgone = 0
-    spread = 0
-    for field, _ in AX:
-        c = used[field][axis(r, field)]
-        if c == 0:
-            fresh += 1
-            continue
-        forgone += unused_now[field]
-        spread += c
-    return (-fresh, forgone, spread,
+    similarity = sum(used[f][axis(r, f)] for f, _ in AX)
+    return (-nearest.get(id(r), len(AX)), similarity,
             -(num(r, "rollouts_n") or 0),
             -(num(r, "turns_median") or 0),
             r.get("_rank", 0))
+
+
+def task_distance(a, b):
+    return sum(1 for f, _ in AX if axis(a, f) != axis(b, f))
 
 
 def replay(ordered: list[dict]) -> tuple[list[dict], bool]:
     """Replay the key over the imported order to recover, per pick, the key
     tuple and the runner-up it beat. Returns (picks, key_reproduces_order).
 
-    Rows are tracked by identity, never by task_id: names and ids can collide
-    across source and delivered copies of a task, and matching on id would drop
-    every row sharing one.
+    Rows are tracked by identity, never by task_id: names and ids collide across
+    source and delivered copies of a task, and matching on id would drop every
+    row sharing one.
     """
     rows = list(ordered)
     for i, r in enumerate(rows):
@@ -161,22 +149,30 @@ def replay(ordered: list[dict]) -> tuple[list[dict], bool]:
     used = {f: collections.Counter() for f, _ in AX}
     picks, faithful = [], True
     remaining = list(rows)
-    for chosen in rows:
-        unused_now = {f: len({axis(r, f) for r in remaining
-                              if used[f][axis(r, f)] == 0}) for f, _ in AX}
-        kf = lambda r: key_tuple(r, used, unused_now)
-        scored = sorted(remaining, key=kf)
-        if scored[0] is not chosen:
-            faithful = False
-        k = kf(chosen)
-        runner = next((r for r in scored if r is not chosen), None)
-        rk = kf(runner) if runner else None
-        decided = next((j for j in range(len(TERMS)) if rk and k[j] != rk[j]), None)
+    nearest: dict[int, int] = {}
+    for step, chosen in enumerate(rows):
+        if step:
+            kf = lambda r: key_tuple(r, used, nearest)
+            scored = sorted(remaining, key=kf)
+            if scored[0] is not chosen:
+                faithful = False
+            k = kf(chosen)
+            runner = next((r for r in scored if r is not chosen), None)
+            rk = kf(runner) if runner else None
+            decided = next((j for j in range(len(TERMS)) if rk and k[j] != rk[j]), None)
+        else:
+            # the seed is chosen by rarity, not by this key, so there is no
+            # contest to report on the first row.
+            k, runner, rk, decided = key_tuple(chosen, used, nearest), None, None, None
         picks.append({"row": chosen, "key": k, "runner": runner, "runner_key": rk,
                       "decided": decided})
         for f, _ in AX:
             used[f][axis(chosen, f)] += 1
         remaining = [r for r in remaining if r is not chosen]
+        for r in remaining:
+            d = task_distance(r, chosen)
+            if id(r) not in nearest or d < nearest[id(r)]:
+                nearest[id(r)] = d
     return picks, faithful
 
 
@@ -197,9 +193,7 @@ def local_order(rows: list[dict]) -> tuple[list[dict], dict]:
     unknown_n = {f: sum(1 for r in pool if axis(r, f) == "unknown") for f, _ in AX}
     out = []
     while pool:
-        unused_now = {f: len({axis(r, f) for r in pool
-                              if used[f][axis(r, f)] == 0}) for f, _ in AX}
-        pick = min(pool, key=lambda r: key_tuple(r, used, unused_now))
+        pick = min(pool, key=lambda r: key_tuple(r, used, {}))
         seq = len(out) + 1
         for field, _ in AX:
             val = axis(pick, field)
@@ -304,14 +298,15 @@ def rationale(pick: dict, position: int, faithful: bool) -> tuple[str, str]:
         name = TERMS[j][0]
         a, b = k[j], rk[j]
         if j == 0:
-            detail = f"opened {-a} fresh {'axis' if -a == 1 else 'axes'} vs {-b}"
+            detail = (f"differs from its nearest already-picked task on {-a} "
+                      f"{'axis' if -a == 1 else 'axes'} vs {-b}")
         elif j == 1:
-            detail = f"its repeat gave up {a} still-free value(s) vs {b}"
+            detail = f"its values have been used {a} times in total vs {b}"
         elif j == 2:
-            detail = f"repeated a value used {a}x vs one used {b}x"
-        elif j == 3:
             detail = f"{-a:,} eligible rollouts vs {-b:,}"
         elif j == 4:
+            detail = f"median {-a:,} turns vs {-b:,}"
+        elif j == 3:
             detail = f"median {-a:,} turns vs {-b:,}"
         else:
             detail = "identical on every measured term; the earlier row wins"
@@ -962,8 +957,8 @@ def build(data: dict, enrich: dict | None, mod, import_note: str | None) -> str:
         # that "more fresh axes" sorts first; show it as the count the reader
         # expects. Pressure is a ratio, so two decimals -- an integer would
         # collapse most distinctions to 0.
-        kt = (f'<span class="keyt">key<br><b>{-k[0]} fresh</b> <b>{k[1]}</b> <b>{k[2]}</b>'
-              f'<br>{k[3]} {k[4]} {k[5]}</span>')
+        kt = (f'<span class="keyt">key<br><b>d{-k[0]}</b> <b>{k[1]}</b>'
+              f'<br>{k[2]} {k[3]} {k[4]}</span>')
         tid = r.get("task_id") or ""
         link = (f'<a href="{HORIZON}{esc(tid)}" target="_blank" rel="noopener noreferrer">'
                 f'{esc(r.get("name") or "unnamed task")}</a>') if tid else esc(r.get("name"))
@@ -1152,15 +1147,15 @@ def build(data: dict, enrich: dict | None, mod, import_note: str | None) -> str:
 
 {sec("At a glance", f'<div class="tiles">{"".join(tiles)}</div>')}
 
-{sec("The key", '''<h2>Six terms, read left to right</h2>
+{sec("The key", '''<h2>Five terms, read left to right</h2>
 <p class="sub">A pick wins on the first term where it beats every rival. Crucially the three axes
 &mdash; language, shape, repository &mdash; are <b>not ranked against each other</b>. Term&nbsp;1
 asks only <i>how many</i> of them a pick leaves untouched, so a task opening a new language
 <i>and</i> a new repo <i>and</i> a new shape beats one opening a new language alone. Ranking the
 axes was the old flaw: language came first, so with many tasks in one repository across many
 languages the list would cycle languages forever and never leave that repository. Term&nbsp;2
-prices what a repeat gives up &mdash; how many values on that axis are still unused and still
-reachable &mdash; so a forced repeat costs nothing and a wasteful one costs a lot. Quality only ever breaks ties between equally diverse
+breaks the many ties on balance: how heavily this task&rsquo;s values have already been used,
+summed across the axes. Quality only ever breaks ties between equally diverse
 candidates.</p>'''
   + f'<ul class="ladder">{"".join(ladder)}</ul>'
   + '<p class="note">Each pick shows its own key as a tuple in the left rail — the three '
